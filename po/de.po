@@ -5,8 +5,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: letter 1.0.0-rc.1\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-09-09 10:54+0200\n"
-"PO-Revision-Date: 2026-09-05 16:06+0200\n"
+"POT-Creation-Date: 2026-09-08 14:41+0200\n"
+"PO-Revision-Date: 2026-09-09 17:03+0200\n"
 "Last-Translator: Christian Lauinger <christian@lauinger-clan.de>\n"
 "Language-Team: German\n"
 "Language: de\n"
@@ -20,7 +20,7 @@ msgstr ""
 #: data/io.github.stalvatero.Letter.desktop.in.in:3
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:4
 msgid "@app_name@"
-msgstr ""
+msgstr "@app_name@"
 
 #: data/io.github.stalvatero.Letter.desktop.in.in:4
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:5
@@ -30,7 +30,7 @@ msgstr "E-Mails lesen und senden"
 #. Translators: Search terms to find this application. Do not translate or localize the semicolons. The list MUST also end with a semicolon.
 #: data/io.github.stalvatero.Letter.desktop.in.in:12
 msgid "email;mail;imap;google;outlook;exchange;"
-msgstr ""
+msgstr "E-Mail;Mail;IMAP;Google;Outlook;Exchange;"
 
 #: data/io.github.stalvatero.Letter.desktop.in.in:20 src/window.blp:242
 #: src/compose-dialog.vala:65
@@ -39,7 +39,7 @@ msgstr "Neue Nachricht"
 
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:9
 msgid "Salvatore Oscurato"
-msgstr ""
+msgstr "Salvatore Oscurato"
 
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:12
 msgid ""
@@ -48,12 +48,20 @@ msgid ""
 "Contacts, so Google, Microsoft 365, Exchange, and IMAP accounts already "
 "configured on the desktop appear here without a second setup."
 msgstr ""
+"Letter ist ein mit GTK 4 und libadwaita entwickeltes GNOME-E-Mail-Programm. "
+"Es verwendet GNOME-Online-Konten und Evolution Data Server, dieselbe "
+"technische Grundlage wie Kalender und Kontakte. Dadurch erscheinen bereits "
+"auf dem Desktop eingerichtete Google-, Microsoft-365-, Exchange- und IMAP-"
+"Konten hier ohne zusätzliche Einrichtung."
 
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:19
 msgid ""
 "Read conversations, search, compose HTML mail, and get notifications. Add "
 "accounts in Settings → Online Accounts. Letter needs GNOME 50 or later."
 msgstr ""
+"Unterhaltungen lesen, suchen, HTML-E-Mails verfassen und Benachrichtigungen "
+"erhalten. Fügen Sie Konten unter Einstellungen → Online-Konten hinzu. Letter "
+"benötigt GNOME 50 oder neuer."
 
 #: data/io.github.stalvatero.Letter.metainfo.xml.in.in:57
 msgid ""
@@ -67,6 +75,8 @@ msgid ""
 "First public beta: reading, composing, search, notifications, and GNOME "
 "Online Accounts."
 msgstr ""
+"Erste öffentliche Betaversion: Lesen, Verfassen, Suchen, Benachrichtigungen "
+"und GNOME-Online-Konten."
 
 #: src/application.vala:51
 msgid "Compose a new message"
@@ -146,7 +156,7 @@ msgstr "Löschen"
 
 #: src/application.vala:408 src/window.vala:5631
 msgid "Undo"
-msgstr ""
+msgstr "Rückgängig"
 
 #: src/application.vala:409 src/window.vala:6778 src/message-reader.vala:1100
 #: src/compose-dialog.vala:100
@@ -204,7 +214,7 @@ msgstr "Nach Unterhaltung gruppieren"
 
 #: src/window.vala:445
 msgid "Search all folders. Filter with contains:, from: and to:"
-msgstr "Alle Ordner durchsuchen. Mit contains:, from: und to: filtern"
+msgstr "Alle Ordner durchsuchen. Filtern mit enthält:, von: und bis:"
 
 #: src/window.vala:1406
 msgid "Checking folders…"
@@ -233,9 +243,8 @@ msgid "Looking in every folder…"
 msgstr "Alle Ordner werden durchsucht …"
 
 #: src/window.vala:1762
-#, fuzzy
 msgid "Searching remaining folders…"
-msgstr "Alle Ordner werden durchsucht …"
+msgstr "Die verbleibenden Ordner werden durchsucht…"
 
 #: src/window.vala:1871 src/window.vala:4353
 #, c-format
@@ -343,26 +352,28 @@ msgstr "Auf Ordner von »%s« wird gewartet …"
 
 #: src/window.vala:2675
 msgid "Loading local cache…"
-msgstr ""
+msgstr "Lokaler Zwischenspeicher wird geladen …"
 
 #: src/window.vala:2883
 msgid "Gmail Labels"
-msgstr ""
+msgstr "Gmail-Labels"
 
 #: src/window.vala:2884
 msgid ""
 "“[Gmail]” groups labels such as Important and Starred. Open one of those "
 "folders to read mail."
 msgstr ""
+"„[Gmail]“ fasst Labels wie „Wichtig“ und „Mit Stern markiert“ zusammen. "
+"Öffnen Sie einen dieser Ordner, um E-Mails zu lesen."
 
 #: src/window.vala:2894
 msgid "Loading Messages"
 msgstr "Nachrichten werden geladen"
 
 #: src/window.vala:2895
-#, fuzzy, c-format
+#, c-format
 msgid "Reading the local list for “%s”…"
-msgstr "Die Liste von »%s« wird abgerufen …"
+msgstr "Die lokale Liste für „%s“ wird geladen…"
 
 #: src/window.vala:2962
 msgid "No Bookmarks"
@@ -482,27 +493,27 @@ msgstr "Für dieses Konto wurde kein Archiv-Ordner gefunden."
 #: src/window.vala:5703
 msgid "Message moved to Trash"
 msgid_plural "Messages moved to Trash"
-msgstr[0] ""
-msgstr[1] ""
+msgstr[0] "Nachricht in den Papierkorb verschoben"
+msgstr[1] "Nachrichten in den Papierkorb verschoben"
 
 #: src/window.vala:5710
 msgid "Message marked as Junk"
 msgid_plural "Messages marked as Junk"
-msgstr[0] ""
-msgstr[1] ""
+msgstr[0] "Nachricht als Spam markiert"
+msgstr[1] "Nachrichten als Spam markiert"
 
 #: src/window.vala:5719
 msgid "Message archived"
 msgid_plural "Messages archived"
-msgstr[0] ""
-msgstr[1] ""
+msgstr[0] "Nachricht archiviert"
+msgstr[1] "Nachrichten archiviert"
 
 #: src/window.vala:5725
 #, c-format
 msgid "Message moved to “%s”"
 msgid_plural "Messages moved to “%s”"
-msgstr[0] ""
-msgstr[1] ""
+msgstr[0] "Nachricht nach »%s« verschoben"
+msgstr[1] "Nachrichten nach »%s« verschoben"
 
 #: src/window.vala:6122
 msgid "Choose where to move the selected messages."
@@ -926,7 +937,7 @@ msgstr "Posteingang"
 #: src/mail-session.vala:392
 msgctxt "Mail folder"
 msgid "Drafts"
-msgstr ""
+msgstr "Entwürfe"
 
 #: src/mail-session.vala:395
 msgctxt "Mail folder"
@@ -936,12 +947,12 @@ msgstr "Gesendet"
 #: src/mail-session.vala:398
 msgctxt "Mail folder"
 msgid "Trash"
-msgstr ""
+msgstr "Papierkorb"
 
 #: src/mail-session.vala:401
 msgctxt "Mail folder"
 msgid "Junk"
-msgstr ""
+msgstr "Spam"
 
 #: src/mail-session.vala:404
 msgctxt "Mail folder"
@@ -966,7 +977,7 @@ msgstr "Archiv"
 #: src/mail-session.vala:416
 msgctxt "Mail folder"
 msgid "Outbox"
-msgstr ""
+msgstr "Ausgang"
 
 #: src/mail-session.vala:1728
 msgid "This message is still syncing with the server. Try again in a moment."
@@ -987,9 +998,9 @@ msgid "Folder names cannot contain slashes."
 msgstr "Ordnernamen dürfen keine Schrägstriche enthalten."
 
 #: src/mail-session.vala:2651
-#, fuzzy, c-format
+#, c-format
 msgid "“%s” is a local view, not a mail folder."
-msgstr "»%s« ist keine gültige E-Mail-Adresse."
+msgstr "„%s“ ist eine lokale Ansicht, kein E-Mail-Ordner."
 
 #: src/mail-session.vala:2664
 #, c-format
@@ -1162,7 +1173,6 @@ msgid "Include original attachments?"
 msgstr "Ursprüngliche Anhänge einbeziehen?"
 
 #: src/compose-dialog.vala:435
-#, fuzzy
 msgid ""
 "You added someone who did not receive the original message. Attach the file "
 "from that message?"
@@ -1171,10 +1181,10 @@ msgid_plural ""
 "from that message?"
 msgstr[0] ""
 "Sie haben jemanden hinzugefügt, der die ursprüngliche Nachricht nicht "
-"erhalten hat. Soll die Datei aus dieser Nachricht angehängt werden?"
+"erhalten hat. Möchten Sie die Datei aus dieser Nachricht anhängen?"
 msgstr[1] ""
 "Sie haben jemanden hinzugefügt, der die ursprüngliche Nachricht nicht "
-"erhalten hat. Soll die Datei aus dieser Nachricht angehängt werden?"
+"erhalten hat. Möchten Sie die Dateien aus dieser Nachricht anhängen?"
 
 #: src/compose-dialog.vala:440
 msgid "Don't Attach"
@@ -1433,7 +1443,6 @@ msgid "Original"
 msgstr "Original"
 
 #: src/compose-dialog.vala:1996
-#, fuzzy
 msgid "Image size"
 msgstr "Bildgröße"
 
