@@ -31,12 +31,7 @@
     <key name="last-account-uid" type="s">
       <default>''</default>
       <summary>Last selected account</summary>
-      <description>UID of the account shown when Mail last quit.</description>
-    </key>
-    <key name="last-folder" type="s">
-      <default>''</default>
-      <summary>Last selected folder</summary>
-      <description>Full name of the folder shown when Mail last quit.</description>
+      <description>UID of the account shown when Mail last quit. Startup always opens Inbox for that account.</description>
     </key>
     <key name="collapsed-folders" type="as">
       <default>[]</default>

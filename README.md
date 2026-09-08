@@ -1,5 +1,7 @@
 # Letter
 
+[![Validate](https://github.com/stalvatero/letter/actions/workflows/ci.yml/badge.svg)](https://github.com/stalvatero/letter/actions/workflows/ci.yml)
+
 Letter is a GTK 4 and libadwaita email client for the GNOME desktop. It sits next to Calendar and Contacts and uses the same identities: **GNOME Online Accounts** for login, **Evolution Data Server** and Camel for mail.
 
 ![Letter with light, accent, and dark themes](data/screenshots/themes-cover.jpg)
@@ -8,7 +10,7 @@ This is not a GNOME Core application, but it follows the clean GNOME 50 look and
 
 Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 
-**0.9.0-beta.1** is the first public beta. It is already meant for daily use: reading, composing, search, notifications and a lot of optimizations are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter.
+**1.0.0-rc.1** is the first release candidate toward 1.0. It is meant for daily use: reading, composing, search, notifications, and cache-first sync are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. This RC gathers feedback and remaining translations (especially German updates) before **1.0.0**.
 
 ### Available languages
 
@@ -47,6 +49,7 @@ Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 
 - After the first full sync, Letter prefers the **local cache** for folder lists, headers, bookmarks, and unread badges so the UI stays responsive
 - Opening a folder reads from cache; the server is checked on the interval you set in Preferences (and when you refresh), not on every click
+- At startup and on each sync cycle, Letter still probes non-Inbox folders lightly: empty lists that have mail on the server, or lists whose remote counts drifted (for example mail filed from a phone)
 - Flag, bookmark, and similar changes update the UI immediately and are pushed to the server on the next sync cycle
 - Sending mail goes out right away; it does not force a full mailbox refresh
 
@@ -124,60 +127,83 @@ Tip: Use the **Microsoft 365** (Graph) account type, not classic Exchange Web Se
 
 ## Install
 
-There is no distribution package yet. For this beta, the easiest path is the install script in the repo (`scripts/install.sh`): it clones the source if needed, installs the build packages for Arch, Fedora, Debian/Ubuntu, or openSUSE, compiles Letter, and installs it to `/usr/local`.
+There is no Flathub listing and no distro package yet. For **1.0.0-rc.1**, download the **Flatpak bundle** from the [GitHub Releases](https://github.com/stalvatero/letter/releases) page (file named like `Letter-1.0.0-rc.1-x86_64.flatpak`).
 
-> **Note — this installs from source.** The first run may download compilers and development packages (`-devel` / `-dev` headers and related tools), depending on what your distribution already has. That is normal for any build-from-source path, and it can look heavier than installing a ready-made app. The script checks what is missing and installs only what Letter needs from your distribution’s **official repositories** (via `pacman`, `dnf`, `apt`, or `zypper`). When a Flatpak or distro package is available, that will be the lighter option for everyday users.
-
-Derivatives of those families (Mint, Pop!_OS, EndeavourOS, and similar) are covered by the same package managers. On openSUSE, prefer **Tumbleweed** or a recent Leap with current GNOME; older Leap releases may be below Letter’s GTK / libadwaita floor.
-
-For easy installation and testing, use those commands in your terminal:
+Letter needs the **GNOME Platform 50** runtime from Flathub. Add the Flathub remote once (if it is not already configured), then install the downloaded file:
 
 ```sh
-git clone https://github.com/stalvatero/letter.git # clone the repo and all you need
-cd letter # enter in the downloaded path
-chmod +x scripts/install.sh # give execute permissions
-./scripts/install.sh # compile and install as normal app
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ~/Downloads/Letter-1.0.0-rc.1-x86_64.flatpak
 ```
 
-The script asks for administrator rights (`sudo`) for packages and for `meson install`. After it finishes, open **Letter** from the app grid. Add at least one account in **Settings → Online Accounts**, then start Letter again.
+Adjust the path to wherever you saved the `.flatpak`. Flatpak will download **org.gnome.Platform//50** from Flathub on first install if it is missing.
+
+Then open **Letter** from the app grid / drawer, or run:
+
+```sh
+flatpak run io.github.stalvatero.Letter
+```
+
+Add at least one account in **Settings → Online Accounts**, then start Letter again if it was already open.
 
 ## Update
 
-To update this build, from the same source tree run (example ~/letter):
+Download the newer `.flatpak` from [Releases](https://github.com/stalvatero/letter/releases) and install it the same way. Flatpak replaces the previous Letter build:
 
 ```sh
-git pull #refresh local tree
-./scripts/install.sh # compile the updates and install as normal app
+flatpak install --user ~/Downloads/Letter-….flatpak
 ```
-
-
 
 ## Uninstall
 
-To remove this build, from the same source tree run:
+```sh
+flatpak uninstall --user io.github.stalvatero.Letter
+```
+
+Online Accounts stay in GNOME Settings. Local Letter data under `~/.var/app/io.github.stalvatero.Letter/` can be removed by hand if you also want a clean slate.
+
+## Build from source
+
+Use this if you prefer a native `/usr/local` install or to hack on Letter. The install script clones the source if needed, installs build packages for Arch, Fedora, Debian/Ubuntu, or openSUSE, compiles, and installs:
+
+```sh
+git clone https://github.com/stalvatero/letter.git
+cd letter
+chmod +x scripts/install.sh
+./scripts/install.sh
+```
+
+> **Note — this installs from source.** The first run may download compilers and development packages (`-devel` / `-dev`). The script only installs what is missing from your distribution’s **official repositories**. Derivatives (Mint, Pop!_OS, EndeavourOS, and similar) use the same package managers. On openSUSE, prefer **Tumbleweed** or a recent Leap with current GNOME.
+
+To update a source install from the same tree:
+
+```sh
+git pull
+./scripts/install.sh
+```
+
+To remove it:
 
 ```sh
 chmod +x scripts/uninstall.sh
 ./scripts/uninstall.sh
 ```
 
-That uninstalls Letter from `/usr/local` and deletes the source tree (including a clone left under `~/.cache/letter/src` when the install script downloaded it). Add `--purge-data` if you also want to delete the local mail cache under `~/.local/share/letter` and `~/.cache/letter`. Online Accounts stay in GNOME Settings.
+That uninstalls from `/usr/local` and can delete the source tree. Add `--purge-data` to also delete `~/.local/share/letter` and `~/.cache/letter`.
 
-Flatpak and native packages will come later.
-
-## Build from source
-
-Use this if you prefer to compile by hand. A public beta build:
+Or compile by hand:
 
 ```sh
-git clone https://github.com/stalvatero/letter.git # clone the repo and all you need
-cd letter # enter in the downloaded path
+git clone https://github.com/stalvatero/letter.git
+cd letter
 meson setup _build --prefix=/usr/local -Dprofile=default
 meson compile -C _build
 sudo meson install -C _build
 ```
 
 The Meson `development` profile is only for local work (`meson devenv`). It uses a different application ID and the libadwaita development stripe.
+
+Maintainers who need to **produce** a `.flatpak` for a GitHub Release can run `./scripts/build-flatpak.sh` (requires `flatpak-builder`; first build is long because it compiles EDS into the sandbox). End users should use the bundle from Releases instead.
 
 ## Contributing
 
@@ -187,7 +213,7 @@ Letter is a personal project. I welcome **bug reports, feature requests, and fee
 
 ## Where it runs
 
-Letter is a GNOME application. I design it, test it, and use it every day on my Arch Linux and **GNOME 50**. That is the supported environment for this beta.
+Letter is a GNOME application. I design it, test it, and use it every day on my Arch Linux and **GNOME 50**. That is the supported environment for this release candidate.
 
 It needs a recent GNOME platform, not “any desktop that happens to have GTK”. GTK 4 has existed since GNOME 40, but Letter also needs current libadwaita, GNOME Online Accounts, and Evolution Data Server. **GNOME 40 or 41 will not work.** The realistic floor is a current GNOME (about 49 or 50 and newer). I do not test older releases and I will not try to keep them working.
 

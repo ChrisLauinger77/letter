@@ -100,7 +100,6 @@ public class Mail.Application : Adw.Application {
             "show-folder-sidebar",
             "folder-pane-width",
             "last-account-uid",
-            "last-folder",
             "collapsed-folders",
             "color-scheme",
             "reader-zoom",

@@ -369,7 +369,7 @@ public class Mail.MailSession : Camel.Session {
                 total = cursor.total,
                 flags = (uint) cursor.flags,
             };
-            apply_gmail_folder_display (node.folder);
+            apply_folder_display_name (node.folder);
             node.children = nodes_from_info (cursor.child);
             nodes.add (node);
             cursor = cursor.next;
@@ -377,26 +377,47 @@ public class Mail.MailSession : Camel.Session {
         return nodes;
     }
 
-    private static void apply_gmail_folder_display (Folder folder) {
-        if (folder.kind == FolderKind.INBOX) {
-            var name = folder.name.down ();
-            if (name == "inbox" || name == "posta in arrivo")
-                folder.name = _("Inbox");
-            return;
+    /* Map well-known folders to the UI locale. Gmail/EDS often ship display
+     * names in the account language; cached trees may also freeze an older
+     * locale — call this whenever a Folder is shown, not only on Camel list. */
+    public static void apply_folder_display_name (Folder folder) {
+        switch (folder.kind) {
+            case FolderKind.INBOX: {
+                var name = folder.name.down ();
+                if (name == "inbox" || name == "posta in arrivo" || name == "in arrivo")
+                    folder.name = C_("Mail folder", "Inbox");
+                break;
+            }
+            case FolderKind.DRAFTS:
+                folder.name = C_("Mail folder", "Drafts");
+                break;
+            case FolderKind.SENT:
+                folder.name = C_("Mail folder", "Sent");
+                break;
+            case FolderKind.TRASH:
+                folder.name = C_("Mail folder", "Trash");
+                break;
+            case FolderKind.JUNK:
+                folder.name = C_("Mail folder", "Junk");
+                break;
+            case FolderKind.ALL:
+                folder.name = C_("Mail folder", "All Mail");
+                break;
+            case FolderKind.STARRED:
+                folder.name = C_("Mail folder", "Starred");
+                break;
+            case FolderKind.IMPORTANT:
+                folder.name = C_("Mail folder", "Important");
+                break;
+            case FolderKind.ARCHIVE:
+                folder.name = C_("Mail folder", "Archive");
+                break;
+            case FolderKind.OUTBOX:
+                folder.name = C_("Mail folder", "Outbox");
+                break;
+            default:
+                break;
         }
-
-        if (folder.kind == FolderKind.ALL) {
-            folder.name = _("All Mail");
-            return;
-        }
-
-        if (folder.kind == FolderKind.STARRED) {
-            folder.name = _("Starred");
-            return;
-        }
-
-        if (folder.kind == FolderKind.IMPORTANT)
-            folder.name = _("Important");
     }
 
     private static bool gmail_is_root_special (Folder folder) {

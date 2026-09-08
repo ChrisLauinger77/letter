@@ -127,6 +127,10 @@ public class Mail.FolderRow : Gtk.ListBoxRow {
         this.count_label.label = this.folder.badge_count.to_string ();
         this.count_label.visible = this.folder.badge_count > 0;
     }
+
+    public void refresh_name () {
+        this.name_label.label = this.folder.name;
+    }
 }
 
 public class Mail.MessageRow : Gtk.Box {

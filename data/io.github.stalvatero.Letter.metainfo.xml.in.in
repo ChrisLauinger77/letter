@@ -52,7 +52,17 @@
     <category>Email</category>
   </categories>
   <releases>
-    <release version="@version@" date="2026-09-03">
+    <release version="@version@" type="development" date="2026-09-08">
+      <description>
+        <p>
+          First 1.0 release candidate. Daily-use mail with cache-first sync,
+          undo for archive, move and trash, Inbox on every startup, and an
+          experimental Flatpak bundle. Feedback and remaining translations
+          welcome before 1.0.0.
+        </p>
+      </description>
+    </release>
+    <release version="0.9.0-beta.1" type="development" date="2026-09-03">
       <description>
         <p>First public beta: reading, composing, search, notifications, and GNOME Online Accounts.</p>
       </description>

@@ -1,0 +1,160 @@
+# Flatpak manifest for Letter 1.0.0-rc.1 (bundle / GitHub Releases; not Flathub yet).
+# Build libraries for GOA / EDS / Camel into the sandbox; talk to the host
+# Online Accounts and EDS daemons over D-Bus (same pattern as Geary).
+#
+# Quick test (from the repo root):
+#   ./scripts/build-flatpak.sh
+#   flatpak run io.github.stalvatero.Letter
+
+app-id: io.github.stalvatero.Letter
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: letter
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --socket=pulseaudio
+  - --share=network
+  - --system-talk-name=org.freedesktop.login1
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.gnome.ControlCenter
+  - --talk-name=org.gnome.OnlineAccounts
+  - --talk-name=org.gnome.evolution.dataserver.*
+  - --talk-name=org.gnome.Contacts
+  - --filesystem=~/.cache/evolution:ro
+  - --filesystem=xdg-download:rw
+  - --filesystem=/tmp
+  - --metadata=X-DConf=migrate-path=/io/github/stalvatero/Letter/
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /man
+  - /share/aclocal
+  - /share/gir-1.0
+  - /share/girepository-1
+  - /share/gtk-doc
+  - /share/man
+  - /share/pkgconfig
+  - /share/vala
+  - '*.la'
+  - '*.a'
+
+modules:
+  - name: rest
+    buildsystem: meson
+    config-opts:
+      - -Dexamples=false
+      - -Dgtk_doc=false
+      - -Dtests=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/rest/0.9/rest-0.9.1.tar.xz
+        sha256: 9266a5c10ece383e193dfb7ffb07b509cc1f51521ab8dad76af96ed14212c2e3
+
+  - name: gnome-online-accounts
+    buildsystem: meson
+    config-opts:
+      - -Dgoabackend=false
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/gnome-online-accounts/3.56/gnome-online-accounts-3.56.5.tar.xz
+        sha256: 23e03dcfa03950b60e9f892f7b729ee31deeb827c655df8f78b8bca5bc197734
+
+  - name: libical
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DBUILD_SHARED_LIBS:BOOL=ON
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DGOBJECT_INTROSPECTION=true
+      - -DICAL_BUILD_DOCS=false
+      - -DICAL_GLIB=true
+      - -DICAL_GLIB_VAPI=true
+    sources:
+      - type: archive
+        url: https://github.com/libical/libical/releases/download/v3.0.20/libical-3.0.20.tar.gz
+        sha256: e73de92f5a6ce84c1b00306446b290a2b08cdf0a80988eca0a2c9d5c3510b4c2
+    cleanup:
+      - /lib/cmake
+
+  - name: evolution-data-server
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_CANBERRA=OFF
+      - -DENABLE_EXAMPLES=OFF
+      - -DENABLE_GOA=ON
+      - -DENABLE_GOOGLE=OFF
+      - -DENABLE_GTK=ON
+      - -DENABLE_GTK_DOC=OFF
+      - -DENABLE_INSTALLED_TESTS=OFF
+      - -DENABLE_INTROSPECTION=ON
+      - -DENABLE_VALA_BINDINGS=ON
+      - -DENABLE_WEATHER=OFF
+      - -DWITH_LIBDB=OFF
+      - -DWITH_OPENLDAP=OFF
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/evolution-data-server/3.58/evolution-data-server-3.58.3.tar.xz
+        sha256: da136d1190d9e8b09499452f6058e24eee6b77f441a8c769f74a52451bf379f1
+    cleanup:
+      - /lib/cmake
+      - /lib/evolution-data-server/*-backends
+      - /libexec
+      - /share/dbus-1/services
+
+  - name: libcanberra
+    config-opts:
+      - --disable-static
+      - --disable-gtk-doc
+      - --disable-oss
+      - --enable-pulse
+      - --disable-udev
+      - --disable-gtk
+      - --enable-gtk3
+      - --disable-lynx
+    sources:
+      - type: archive
+        url: https://0pointer.de/lennart/projects/libcanberra/libcanberra-0.30.tar.xz
+        sha256: c2b671e67e0c288a69fc33dc1b6f1b534d07882c2aceed37004bf48c601afa72
+      - type: patch
+        path: flatpak/libcanberra/0001-gtk-Don-t-assume-all-GdkDisplays-are-GdkX11Displays-.patch
+    cleanup:
+      - '*.la'
+      - /include
+      - /lib/pkgconfig
+      - /share/gtk-doc
+      - /share/man
+      - /share/vala
+
+  - name: gsound
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/gsound/1.0/gsound-1.0.3.tar.xz
+        sha256: ca2d039e1ebd148647017a7f548862350bc9af01986d39f10cfdc8e95f07881a
+
+  - name: letter
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+      - -Dprofile=default
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .flatpak-builder
+          - .git
+          - _build
+          - _flatpak_build
+          - build
+          - build-flatpak
+          - build-ci
+          - repo
