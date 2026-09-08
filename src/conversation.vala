@@ -603,6 +603,7 @@ public class Mail.Conversation : Object {
             case "fwd":
             case "i":
             case "inoltra":
+            case "inoltro":
             case "wg":
                 return true;
             default:
@@ -620,6 +621,7 @@ public class Mail.Conversation : Object {
             case "fwd":
             case "i":
             case "inoltra":
+            case "inoltro":
             case "aw":
             case "sv":
             case "vs":

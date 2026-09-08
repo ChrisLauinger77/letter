@@ -354,6 +354,7 @@ public class Mail.MailSession : Camel.Session {
         public Folder destination;
         public GenericArray<string> uids;
         public GenericArray<Message>? messages;
+        public bool delete_original;
     }
 
     private static GenericArray<FolderNode> nodes_from_info (Camel.FolderInfo? info) {
@@ -549,18 +550,50 @@ public class Mail.MailSession : Camel.Session {
 
         GenericArray<Message>? messages = null;
         var merged = false;
+        uint added = 0;
+        uint gone = 0;
         if (refresh && previous != null && previous.length > 0)
-            messages = merge_folder_messages (camel_folder, folder, previous);
-        if (messages == null)
+            messages = merge_folder_messages (camel_folder, folder, previous, out added, out gone);
+        if (messages == null) {
+            if (refresh && previous != null && previous.length > 0) {
+                Utils.sync_log (
+                    "headers “%s” delta too large (+%u -%u) — full collect (had %u)".printf (
+                        folder.name,
+                        added,
+                        gone,
+                        previous.length
+                    )
+                );
+            }
             messages = yield collect_messages (camel_folder, folder, cancellable);
-        else
+        } else {
             merged = true;
-        if (refresh)
-            Utils.sync_log ("headers “%s” %s (%u messages)".printf (
+        }
+        if (refresh) {
+            if (merged && added == 0 && gone == 0) {
+                Utils.sync_log ("headers “%s” unchanged (%u messages)".printf (
+                    folder.name,
+                    messages.length
+                ));
+            } else if (merged) {
+                Utils.sync_log ("headers “%s” delta-merge +%u -%u → %u messages".printf (
+                    folder.name,
+                    added,
+                    gone,
+                    messages.length
+                ));
+            } else {
+                Utils.sync_log ("headers “%s” full-collect (%u messages)".printf (
+                    folder.name,
+                    messages.length
+                ));
+            }
+        } else if (messages.length >= 500) {
+            Utils.sync_log ("headers “%s” local-summary (%u messages)".printf (
                 folder.name,
-                merged ? "delta-merge" : "full-collect",
                 messages.length
             ));
+        }
 
         apply_counts_from_messages (folder, messages);
         messages = retain_local_only (messages, previous);
@@ -995,9 +1028,14 @@ public class Mail.MailSession : Camel.Session {
         var outgoing = folder.kind == FolderKind.SENT
             || folder.kind == FolderKind.DRAFTS
             || folder.kind == FolderKind.OUTBOX;
+        var t0 = Utils.sync_tick ();
         var uids = folder_list_uids (camel_folder);
+        var total = uids.length;
+        if (total >= 500) {
+            Utils.sync_log ("collect_messages “%s” begin %u uids".printf (folder.name, total));
+        }
         var messages = new GenericArray<Message> ();
-        for (uint i = 0; i < uids.length; i++) {
+        for (uint i = 0; i < total; i++) {
             if (cancellable != null && cancellable.is_cancelled ())
                 throw new IOError.CANCELLED ("Cancelled");
 
@@ -1006,9 +1044,25 @@ public class Mail.MailSession : Camel.Session {
                 messages.add (message_from_info (uids[i], info, folder, outgoing, camel_folder));
 
             if (i % 48 == 47) {
+                if (total >= 2000 && (i + 1) % 2000 == 0) {
+                    Utils.sync_log ("collect_messages “%s” %u/%u %s".printf (
+                        folder.name,
+                        i + 1,
+                        total,
+                        Utils.sync_ms (t0)
+                    ));
+                }
                 Idle.add (collect_messages.callback);
                 yield;
             }
+        }
+
+        if (total >= 500) {
+            Utils.sync_log ("collect_messages “%s” done %u msgs %s".printf (
+                folder.name,
+                messages.length,
+                Utils.sync_ms (t0)
+            ));
         }
 
         messages.sort ((a, b) => {
@@ -1024,30 +1078,49 @@ public class Mail.MailSession : Camel.Session {
     private GenericArray<Message>? merge_folder_messages (
         Camel.Folder camel_folder,
         Folder folder,
-        GenericArray<Message> previous
+        GenericArray<Message> previous,
+        out uint added,
+        out uint gone
     ) {
+        added = 0;
+        gone = 0;
         var uids = folder_list_uids (camel_folder);
         var have = new HashTable<string, Message> (str_hash, str_equal);
         for (uint i = 0; i < previous.length; i++)
             have.set (previous[i].uid, previous[i]);
 
         var live = new HashTable<string, uint8> (str_hash, str_equal);
-        uint added = 0;
         for (uint i = 0; i < uids.length; i++) {
             live.set (uids[i], 1);
             if (!have.contains (uids[i]))
                 added++;
         }
 
-        uint gone = 0;
         for (uint i = 0; i < previous.length; i++) {
             if (!live.contains (previous[i].uid))
                 gone++;
         }
 
-        if (added == 0 && gone == 0)
-            return previous.length == uids.length ? previous : null;
-        if (added + gone > 500)
+        if (added == 0 && gone == 0) {
+            if (previous.length != uids.length)
+                return null;
+            /* UID set unchanged — still refresh seen/flagged from Camel so
+             * badges and bookmarks stay cache-correct without a full collect. */
+            for (uint i = 0; i < previous.length; i++) {
+                var info = camel_folder.get_message_info (previous[i].uid);
+                if (info == null)
+                    continue;
+                previous[i].seen = (info.get_flags () & Camel.MessageFlags.SEEN) != 0;
+                previous[i].flagged = (info.get_flags () & Camel.MessageFlags.FLAGGED) != 0;
+            }
+            return previous;
+        }
+        /* Allow larger deltas on bulk folders (phone moved many mails) before
+         * giving up and rebuilding tens of thousands of headers. */
+        var max_delta = folder_is_heavy (folder) || folder.kind == FolderKind.SENT
+            ? 2000
+            : 500;
+        if (added + gone > max_delta)
             return null;
 
         var outgoing = folder.kind == FolderKind.SENT
@@ -1677,17 +1750,10 @@ public class Mail.MailSession : Camel.Session {
             Camel.MessageFlags.SEEN,
             seen ? Camel.MessageFlags.SEEN : 0
         );
-        try {
-            yield enter_camel (true);
-            try {
-                yield camel_folder.synchronize_message (uid, Priority.DEFAULT, cancellable);
-            } finally {
-                leave_camel (true);
-            }
-        } catch (Error sync_error) {
-            debug ("Could not synchronize read state: %s", sync_error.message);
-        }
         apply_camel_counts (folder, camel_folder);
+        var uids = new GenericArray<string> ();
+        uids.add (uid);
+        enqueue_flag_flush (account, folder, uids);
     }
 
     public async uint prefetch_recent (
@@ -1973,16 +2039,56 @@ public class Mail.MailSession : Camel.Session {
             destination = destination,
             uids = uids,
             messages = messages,
+            delete_original = true,
         };
         bump_transfer_pending (account, from, 1);
         if (from.full_name != destination.full_name)
             bump_transfer_pending (account, destination, 1);
         this.transfer_flush_queue.add (job);
-        Utils.sync_log ("move flush queued “%s” → “%s” %u messages".printf (
+        Utils.sync_log ("move flush deferred “%s” → “%s” %u messages".printf (
             from.name,
             destination.name,
             uids.length
         ));
+    }
+
+    /* Copy without removing from source (Gmail Important label). Deferred like moves. */
+    public void enqueue_copy_messages (
+        Account account,
+        Folder from,
+        Folder destination,
+        GenericArray<string> uids,
+        GenericArray<Message>? messages
+    ) {
+        if (uids.length == 0)
+            return;
+
+        var job = new TransferFlushJob () {
+            account = account,
+            from = from,
+            destination = destination,
+            uids = uids,
+            messages = messages,
+            delete_original = false,
+        };
+        bump_transfer_pending (account, from, 1);
+        if (from.full_name != destination.full_name)
+            bump_transfer_pending (account, destination, 1);
+        this.transfer_flush_queue.add (job);
+        Utils.sync_log ("copy flush deferred “%s” → “%s” %u messages".printf (
+            from.name,
+            destination.name,
+            uids.length
+        ));
+    }
+
+    /* Push deferred flag/move/copy jobs (call from sync-interval / manual refresh). */
+    public void flush_pending_local_changes () {
+        if (this.flag_flush_queue.length > 0)
+            Utils.sync_log ("flushing deferred flags (%u queue)".printf (this.flag_flush_queue.length));
+        if (this.transfer_flush_queue.length > 0)
+            Utils.sync_log ("flushing deferred transfers (%u queue)".printf (this.transfer_flush_queue.length));
+        pump_flag_flush.begin ();
         pump_transfer_flush.begin ();
     }
 
@@ -2191,8 +2297,9 @@ public class Mail.MailSession : Camel.Session {
         };
         this.flag_flush_latest.set (flag_flush_key (account, folder), job);
         this.flag_flush_queue.add (job);
-        Utils.sync_log ("flag flush queued “%s” %u messages".printf (folder.name, uids.length));
-        pump_flag_flush.begin ();
+        /* Cache-first: local Camel flags are already set. Server push waits for
+         * sync-interval / manual refresh (flush_pending_local_changes). */
+        Utils.sync_log ("flag flush deferred “%s” %u messages".printf (folder.name, uids.length));
     }
 
     private async void pump_flag_flush () {
@@ -2229,20 +2336,25 @@ public class Mail.MailSession : Camel.Session {
         const uint BATCH = 3;
         uint done = 0;
         var t0 = Utils.sync_tick ();
+        var logged_pause = false;
         while (done < job.uids.length) {
             if (this.flag_flush_latest.get (key) != job)
                 return;
 
             if (this.high_refresh_waiters > 0) {
-                Utils.sync_log ("flag flush paused “%s” for user (%u/%u)".printf (
-                    job.folder.name,
-                    done,
-                    job.uids.length
-                ));
-                Timeout.add (20, flush_folder_flags.callback);
+                if (!logged_pause) {
+                    Utils.sync_log ("flag flush paused “%s” for user (%u/%u)".printf (
+                        job.folder.name,
+                        done,
+                        job.uids.length
+                    ));
+                    logged_pause = true;
+                }
+                Timeout.add (250, flush_folder_flags.callback);
                 yield;
                 continue;
             }
+            logged_pause = false;
 
             yield enter_camel (false);
             try {
@@ -2326,17 +2438,22 @@ public class Mail.MailSession : Camel.Session {
         const uint BATCH = 1;
         uint done = 0;
         var t0 = Utils.sync_tick ();
+        var logged_pause = false;
         while (done < job.uids.length) {
             if (this.high_refresh_waiters > 0) {
-                Utils.sync_log ("move flush paused “%s” for user (%u/%u)".printf (
-                    job.from.name,
-                    done,
-                    job.uids.length
-                ));
-                Timeout.add (20, flush_folder_transfers.callback);
+                if (!logged_pause) {
+                    Utils.sync_log ("move flush paused “%s” for user (%u/%u)".printf (
+                        job.from.name,
+                        done,
+                        job.uids.length
+                    ));
+                    logged_pause = true;
+                }
+                Timeout.add (250, flush_folder_transfers.callback);
                 yield;
                 continue;
             }
+            logged_pause = false;
 
             var end = done + BATCH;
             if (end > job.uids.length)
@@ -2359,7 +2476,7 @@ public class Mail.MailSession : Camel.Session {
                     yield source_folder.transfer_messages_to (
                         batch,
                         dest_folder,
-                        true,
+                        job.delete_original,
                         Priority.LOW,
                         null,
                         out transferred
@@ -2593,6 +2710,7 @@ public class Mail.MailSession : Camel.Session {
         drop_account_bodies (account);
         reset_prefetch_progress (account);
         delete_folder_tree_cache (uid);
+        delete_header_list_cache (uid);
         delete_account_tree (Path.build_filename (mail_cache_root (), uid));
         delete_account_tree (Path.build_filename (mail_data_root (), uid));
     }
@@ -2612,6 +2730,33 @@ public class Mail.MailSession : Camel.Session {
         } catch (Error e) {
             if (!(e is IOError.NOT_FOUND))
                 debug ("Could not delete folder tree cache: %s", e.message);
+        }
+    }
+
+    /* Persisted Letter header lists so Archive/Sent reopen without walking
+     * Camel's full UID set (collect_messages) on every cold start. */
+    public static string header_list_cache_dir () {
+        return Path.build_filename (Environment.get_user_cache_dir (), "letter", "header-lists");
+    }
+
+    public static string header_list_cache_file (string account_uid, string folder_full_name) {
+        var account_safe = Checksum.compute_for_string (ChecksumType.SHA256, account_uid);
+        var folder_safe = Checksum.compute_for_string (ChecksumType.SHA256, folder_full_name);
+        return Path.build_filename (header_list_cache_dir (), account_safe, folder_safe);
+    }
+
+    public static void delete_header_list_cache (string account_uid) {
+        var account_safe = Checksum.compute_for_string (ChecksumType.SHA256, account_uid);
+        var root = header_list_cache_dir ();
+        var dir_path = Path.build_filename (root, account_safe);
+        if (!dir_path.has_prefix (root + Path.DIR_SEPARATOR_S) && dir_path != root)
+            return;
+        try {
+            var file = File.new_for_path (dir_path);
+            if (file.query_exists ())
+                delete_file_recursive (file);
+        } catch (Error e) {
+            debug ("Could not delete header list cache: %s", e.message);
         }
     }
 
@@ -2746,7 +2891,8 @@ public class Mail.MailSession : Camel.Session {
         string? bcc = null,
         GenericArray<Attachment>? attachments = null,
         MessageContent? reply_of = null,
-        Cancellable? cancellable = null
+        Cancellable? cancellable = null,
+        bool is_forward = false
     ) throws Error {
         ensure_can_send (account, to, cc, bcc);
         var identity = get_identity (account);
@@ -2775,7 +2921,8 @@ public class Mail.MailSession : Camel.Session {
             body,
             html,
             attachments,
-            reply_of
+            reply_of,
+            is_forward
         );
 
         var transport = yield open_transport (account, cancellable);
@@ -2828,6 +2975,7 @@ public class Mail.MailSession : Camel.Session {
         string? bcc = null,
         GenericArray<Attachment>? attachments = null,
         MessageContent? reply_of = null,
+        bool is_forward = false,
         Cancellable? cancellable = null
     ) throws Error {
         var identity = get_identity (account);
@@ -2847,7 +2995,8 @@ public class Mail.MailSession : Camel.Session {
             body,
             html,
             attachments,
-            reply_of
+            reply_of,
+            is_forward
         );
         Folder? drafts;
         var uid = yield save_to_folder (account, FolderKind.DRAFTS, mime, cancellable, out drafts);
@@ -2872,7 +3021,8 @@ public class Mail.MailSession : Camel.Session {
         string body,
         string? html,
         GenericArray<Attachment>? attachments,
-        MessageContent? reply_of = null
+        MessageContent? reply_of = null,
+        bool is_forward = false
     ) {
         var from_addr = new Camel.InternetAddress ();
         from_addr.add (identity.name, identity.address);
@@ -2887,7 +3037,7 @@ public class Mail.MailSession : Camel.Session {
             mime.set_recipients (Camel.RECIPIENT_TYPE_BCC, bcc_addr);
         mime.set_subject (subject.strip ().length > 0 ? subject.strip () : _("(No subject)"));
         mime.set_date ((time_t) new DateTime.now_local ().to_unix (), 0);
-        apply_outgoing_thread_headers (mime, identity, reply_of);
+        apply_outgoing_thread_headers (mime, identity, reply_of, is_forward);
 
         var plain = body ?? "";
         var has_html = html != null && html.strip ().length > 0;
@@ -2904,7 +3054,8 @@ public class Mail.MailSession : Camel.Session {
     private static void apply_outgoing_thread_headers (
         Camel.MimeMessage mime,
         Identity identity,
-        MessageContent? reply_of
+        MessageContent? reply_of,
+        bool is_forward = false
     ) {
         mime.set_message_id (Camel.header_msgid_generate (message_id_domain (identity.address)));
         if (reply_of == null)
@@ -2913,7 +3064,10 @@ public class Mail.MailSession : Camel.Session {
         var parent_id = angle_message_id (reply_of.message_id);
         if (parent_id != null) {
             var medium = (Camel.Medium) mime;
-            medium.set_header ("In-Reply-To", parent_id);
+            /* Forwards keep References / Conversation-ID but not In-Reply-To
+             * (that would look like a reply). */
+            if (!is_forward)
+                medium.set_header ("In-Reply-To", parent_id);
             var refs = unfold_header (reply_of.references);
             if (refs.length == 0)
                 refs = unfold_header (reply_of.in_reply_to);

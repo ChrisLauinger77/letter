@@ -38,6 +38,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
     private uint initial_attachment_count;
     private MessageContent? reply_of;
     private MessageContent? thread_of;
+    private bool is_forward;
     private Message? editing_draft;
     private Folder? editing_draft_folder;
     private Account? editing_draft_account;
@@ -76,6 +77,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         var edit_body = resend || editing;
         this.reply_of = (!forward_quote && !edit_body) ? quoted : null;
         this.thread_of = thread_parent_for_compose (quoted, forward_quote, edit_body, editing);
+        this.is_forward = forward_quote;
         this.focus_to_field = quoted == null || forward_quote;
         this.skip_initial_signature = edit_body;
         resizable = true;
@@ -256,8 +258,13 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         bool edit_body,
         bool editing_draft
     ) {
-        if (forward_quote || quoted == null)
+        if (quoted == null)
             return null;
+        /* Forwards keep Conversation-ID / Thread-Index / References so the
+         * sent copy joins the same conversation in Letter (and clients that
+         * honour those headers). */
+        if (forward_quote)
+            return quoted;
         if (!edit_body)
             return quoted;
         if (!editing_draft)
@@ -669,7 +676,9 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
                 html,
                 bcc,
                 attachments,
-                thread_of
+                thread_of,
+                null,
+                this.is_forward
             );
             yield replace_editing_draft ();
             app?.contacts.remember_recipients (to_recipients);
@@ -686,7 +695,8 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
                     html,
                     bcc,
                     attachments,
-                    thread_of
+                    thread_of,
+                    this.is_forward
                 );
                 yield finish_editing_draft (account, saved);
                 app?.show_mail_toast (
@@ -796,6 +806,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         formats.append (command_button ("format-indent-more-symbolic", _("Increase Indent"), "Indent"));
         formats.append (emoji_button ());
         formats.append (icon_action_button ("image-x-generic-symbolic", _("Insert Image"), () => prompt_insert_image.begin ()));
+        formats.append (this.body_view.create_image_size_drop (() => this.toolbar_live));
         bar.append (formats);
 
         var attach = new Gtk.Button.from_icon_name ("mail-attachment-symbolic") {
@@ -1564,7 +1575,11 @@ public class Mail.ComposeHtmlView : Gtk.Box {
     private string? current_image_id;
     private bool loaded;
     private bool focus_editor;
+    private bool spell_ready;
     private SourceFunc? loaded_callback;
+
+    public signal void image_selection_changed (string? id, string size);
+    public signal void inline_image_presence_changed (bool present);
 
     private class StoredInlineImage {
         public string id;
@@ -1626,7 +1641,11 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         this.webview.decide_policy.connect (on_decide_policy);
         this.webview.load_changed.connect (on_load_changed);
         this.webview.context_menu.connect (on_context_menu);
-        enable_spell_checking ();
+        /* Spell checking waits until the editor is focused so WebKit/Hunspell
+         * setup does not compete with the first paint and keystrokes. */
+        var focus = new Gtk.EventControllerFocus ();
+        focus.enter.connect (() => ensure_spell_checking ());
+        this.webview.add_controller (focus);
         add_editing_shortcuts ();
         add_file_drop_target ();
         add_image_size_actions ();
@@ -1737,7 +1756,14 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         if (parts.length < 2)
             return;
         if (parts[0] == "select") {
-            this.current_image_id = parts[1];
+            var id = parts[1].length > 0 ? parts[1] : null;
+            var size = parts.length >= 3 && parts[2].length > 0 ? parts[2] : "original";
+            this.current_image_id = id;
+            image_selection_changed (id, size);
+            return;
+        }
+        if (parts[0] == "imgcount") {
+            inline_image_presence_changed (int.parse (parts[1]) > 0);
             return;
         }
         if (parts[0] == "size" && parts.length >= 3) {
@@ -1777,6 +1803,9 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         stored.pixbuf = store_pixbuf;
         this.inline_images.set (id, stored);
         this.current_image_id = id;
+        /* Vala owns the insert path — do not wait for the JS bridge to show the toolbar. */
+        inline_image_presence_changed (true);
+        image_selection_changed (id, "original");
 
         unowned uint8[] data = store_bytes.get_data ();
         var html = ("<img class=\"mail-inline-image\" draggable=\"true\" "
@@ -1837,6 +1866,8 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         this.inline_images.remove (id);
         if (this.current_image_id == id)
             this.current_image_id = null;
+        inline_image_presence_changed (this.inline_images.size () > 0);
+        image_selection_changed (null, "original");
         var js = "window.mailCompose && window.mailCompose.removeImage(%s);".printf (js_string (id));
         this.webview.evaluate_javascript.begin (js, -1, null, null, null, (obj, res) => {
             try {
@@ -1949,6 +1980,69 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         operation.run_dialog (parent);
     }
 
+    public delegate bool AllowChangeFunc ();
+
+    public Gtk.DropDown create_image_size_drop (owned AllowChangeFunc? allow_change = null) {
+        var drop = new Gtk.DropDown.from_strings ({
+            _("Small"),
+            _("Medium"),
+            _("Original"),
+        }) {
+            selected = 2,
+            valign = Gtk.Align.CENTER,
+            vexpand = false,
+            sensitive = false,
+            visible = false,
+            tooltip_text = _("Image size"),
+        };
+        drop.add_css_class ("compose-image-size-drop");
+        drop.focus_on_click = false;
+        drop.hide ();
+
+        var syncing = false;
+        inline_image_presence_changed.connect ((present) => {
+            drop.visible = present;
+            if (!present) {
+                syncing = true;
+                drop.sensitive = false;
+                drop.selected = 2;
+                syncing = false;
+            }
+        });
+        image_selection_changed.connect ((id, size) => {
+            if (id != null && id.length > 0)
+                drop.visible = true;
+            syncing = true;
+            drop.sensitive = id != null && id.length > 0;
+            if (size == "small")
+                drop.selected = 0;
+            else if (size == "medium")
+                drop.selected = 1;
+            else
+                drop.selected = 2;
+            syncing = false;
+        });
+
+        drop.notify["selected"].connect (() => {
+            if (syncing || !drop.sensitive || !drop.visible)
+                return;
+            if (allow_change != null && !allow_change ())
+                return;
+            string[] sizes = { "small", "medium", "original" };
+            if (drop.selected < sizes.length)
+                run_compose_image_js ("applySize", sizes[drop.selected]);
+        });
+
+        return drop;
+    }
+
+    private void ensure_spell_checking () {
+        if (this.spell_ready)
+            return;
+        this.spell_ready = true;
+        enable_spell_checking ();
+    }
+
     private void enable_spell_checking () {
         var languages = Utils.spell_language_codes ();
         this.spell_langs = new string[languages.length];
@@ -1981,6 +2075,8 @@ public class Mail.ComposeHtmlView : Gtk.Box {
     private bool on_context_menu (WebKit.ContextMenu menu, WebKit.HitTestResult hit) {
         if (!hit.context_is_editable ())
             return false;
+
+        ensure_spell_checking ();
 
         var misspelled = false;
         var has_learn = false;
@@ -2203,9 +2299,8 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         var shortcuts = new Gtk.ShortcutController () {
             scope = Gtk.ShortcutScope.LOCAL,
         };
-        add_edit_shortcut (shortcuts, "<Control>z", WebKit.EDITING_COMMAND_UNDO);
-        add_edit_shortcut (shortcuts, "<Control><Shift>z", WebKit.EDITING_COMMAND_REDO);
-        add_edit_shortcut (shortcuts, "<Control>y", WebKit.EDITING_COMMAND_REDO);
+        /* Ctrl+Z/Y are handled inside the contenteditable (document.execCommand),
+         * so they stay on the DOM undo stack and stay fast. Do not bind them here. */
         add_edit_shortcut (shortcuts, "<Control>b", "Bold");
         add_edit_shortcut (shortcuts, "<Control>i", "Italic");
         add_edit_shortcut (shortcuts, "<Control>u", "Underline");
@@ -2237,14 +2332,9 @@ public class Mail.ComposeHtmlView : Gtk.Box {
 
         var shift = (mods & Gdk.ModifierType.SHIFT_MASK) != 0;
         var key = Gdk.keyval_to_lower (keyval);
-        if (key == Gdk.Key.z) {
-            apply_command (shift ? WebKit.EDITING_COMMAND_REDO : WebKit.EDITING_COMMAND_UNDO);
-            return true;
-        }
-        if (key == Gdk.Key.y) {
-            apply_command (WebKit.EDITING_COMMAND_REDO);
-            return true;
-        }
+        /* Leave Ctrl+Z / Ctrl+Y to the in-page handler. */
+        if (key == Gdk.Key.z || key == Gdk.Key.y)
+            return false;
         if (key == Gdk.Key.b && !shift) {
             apply_command ("Bold");
             return true;
@@ -2610,39 +2700,6 @@ body {
   outline: 2px solid #3584e4;
   outline-offset: 2px;
 }
-#mail-img-size {
-  position: absolute;
-  z-index: 20;
-  display: none;
-  gap: 2px;
-  padding: 3px;
-  border-radius: 999px;
-  background: Canvas;
-  color: CanvasText;
-  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-  box-shadow: 0 2px 10px color-mix(in srgb, CanvasText 18%, transparent);
-  user-select: none;
-  -webkit-user-select: none;
-  pointer-events: auto;
-  touch-action: manipulation;
-}
-#mail-img-size button {
-  margin: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: 12px/1.2 system-ui, sans-serif;
-  padding: 5px 10px;
-  border-radius: 999px;
-  cursor: pointer;
-}
-#mail-img-size button[aria-pressed="true"] {
-  background: #3584e4;
-  color: #fff;
-}
-#mail-img-size button.mail-img-delete {
-  color: #c01c28;
-}
 """);
         } else {
             css.append ("""
@@ -2746,12 +2803,6 @@ blockquote:not(.mail-quote) {
                 var contextLink = null;
                 var SIZE_SMALL = """ + INLINE_SMALL_WIDTH.to_string () + """;
                 var SIZE_MEDIUM = """ + INLINE_MEDIUM_WIDTH.to_string () + """;
-                var labels = {
-                    small: """ + js_string (_("Small")) + """,
-                    medium: """ + js_string (_("Medium")) + """,
-                    original: """ + js_string (_("Original")) + """,
-                    remove: """ + js_string (_("Delete")) + """
-                };
 
                 function closest(node, selector) {
                     if (!node)
@@ -2829,7 +2880,8 @@ blockquote:not(.mail-quote) {
                 }
 
                 /* Instant, in-page resize. Vala may later replace the data URI
-                 * with a recompressed copy; the UI must not depend on that. */
+                 * with a recompressed copy; the UI must not depend on that.
+                 * Size UI lives in the GTK format toolbar, not a floating bar. */
                 function applySize(size) {
                     var img = selectedImg;
                     if (!img || !resizableImage(img))
@@ -2852,110 +2904,39 @@ blockquote:not(.mail-quote) {
                     img.style.height = 'auto';
                     img.style.maxWidth = '100%';
                     img.setAttribute('data-mail-size', size);
-                    markBar();
-                    placeBar();
+                    notifySelection();
                     var id = imageId(img);
                     if (id)
                         postCompose('size|' + id + '|' + size);
                 }
 
-                function barAction(e, run) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (e.stopImmediatePropagation)
-                        e.stopImmediatePropagation();
-                    run();
+                function notifyImagePresence() {
+                    var n = editor.querySelectorAll('img').length;
+                    postCompose('imgcount|' + n);
                 }
 
-                function ensureBar() {
-                    var bar = document.getElementById('mail-img-size');
-                    if (bar)
-                        return bar;
-                    bar = document.createElement('div');
-                    bar.id = 'mail-img-size';
-                    bar.setAttribute('contenteditable', 'false');
-                    bar.addEventListener('pointerdown', function (e) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                    });
-                    bar.addEventListener('mousedown', function (e) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                    });
-                    ['small', 'medium', 'original'].forEach(function (size) {
-                        var button = document.createElement('button');
-                        button.type = 'button';
-                        button.dataset.size = size;
-                        button.textContent = labels[size];
-                        button.addEventListener('click', function (e) {
-                            barAction(e, function () { applySize(size); });
-                        });
-                        bar.appendChild(button);
-                    });
-                    var remove = document.createElement('button');
-                    remove.type = 'button';
-                    remove.className = 'mail-img-delete';
-                    remove.textContent = labels.remove;
-                    remove.addEventListener('click', function (e) {
-                        barAction(e, function () {
-                            if (window.mailCompose && window.mailCompose.requestDelete)
-                                window.mailCompose.requestDelete();
-                        });
-                    });
-                    bar.appendChild(remove);
-                    document.body.appendChild(bar);
-                    return bar;
-                }
-
-                function markBar() {
-                    var bar = document.getElementById('mail-img-size');
-                    if (!bar)
-                        return;
-                    var size = selectedImg && selectedImg.getAttribute('data-mail-size') || 'original';
-                    var buttons = bar.querySelectorAll('button[data-size]');
-                    for (var i = 0; i < buttons.length; i++)
-                        buttons[i].setAttribute('aria-pressed', buttons[i].dataset.size === size ? 'true' : 'false');
-                }
-
-                function placeBar() {
-                    var bar = ensureBar();
-                    if (!selectedImg) {
-                        bar.style.display = 'none';
-                        return;
-                    }
-                    bar.style.display = 'flex';
-                    markBar();
-                    var rect = selectedImg.getBoundingClientRect();
-                    var top = window.scrollY + rect.top - bar.offsetHeight - 8;
-                    if (top < window.scrollY + 4)
-                        top = window.scrollY + rect.bottom + 8;
-                    bar.style.top = top + 'px';
-                    bar.style.left = Math.max(8, window.scrollX + rect.left) + 'px';
+                function notifySelection() {
+                    var id = imageId(selectedImg) || '';
+                    var size = (selectedImg && selectedImg.getAttribute('data-mail-size')) || 'original';
+                    postCompose('select|' + id + '|' + size);
                 }
 
                 function clearSelection() {
                     if (selectedImg)
                         selectedImg.classList.remove('mail-img-selected');
                     selectedImg = null;
-                    var bar = document.getElementById('mail-img-size');
-                    if (bar)
-                        bar.style.display = 'none';
+                    notifySelection();
                 }
 
                 function selectImage(img) {
                     rememberNatural(img);
-                    if (selectedImg === img) {
-                        placeBar();
-                    } else {
+                    if (selectedImg !== img) {
                         if (selectedImg)
                             selectedImg.classList.remove('mail-img-selected');
                         selectedImg = img;
                         img.classList.add('mail-inline-image', 'mail-img-selected');
-                        placeBar();
                     }
-                    var id = imageId(img);
-                    if (id)
-                        postCompose('select|' + id);
+                    notifySelection();
                 }
 
                 window.mailCompose = {
@@ -2975,6 +2956,7 @@ blockquote:not(.mail-quote) {
                                 rememberNatural(img);
                             }, { once: true });
                         }
+                        notifyImagePresence();
                     },
                     applySize: applySize,
                     requestSize: applySize,
@@ -2984,6 +2966,7 @@ blockquote:not(.mail-quote) {
                         if (img)
                             img.remove();
                         clearSelection();
+                        notifyImagePresence();
                         if (id)
                             postCompose('delete|' + id);
                     },
@@ -3007,6 +2990,7 @@ blockquote:not(.mail-quote) {
                         if (img)
                             img.remove();
                         clearSelection();
+                        notifyImagePresence();
                     },
                     removeLink: function () {
                         var link = contextLink;
@@ -3203,7 +3187,7 @@ blockquote:not(.mail-quote) {
                 document.addEventListener('pointerdown', function (e) {
                     if (!e.target || !e.target.closest)
                         return;
-                    if (e.target.closest('#mail-img-size, #mail-compose-bridge'))
+                    if (e.target.closest('#mail-compose-bridge'))
                         return;
                     if (resizableImage(e.target))
                         return;
@@ -3219,16 +3203,22 @@ blockquote:not(.mail-quote) {
                     if (resizableImage(e.target))
                         selectImage(e.target);
                     contextLink = closest(e.target, 'a');
-                    if (!resizableImage(e.target) && window.mailCompose && window.mailCompose.selectSpellWord)
-                        window.mailCompose.selectSpellWord();
                 });
 
-                document.addEventListener('scroll', function () {
-                    if (selectedImg)
-                        placeBar();
-                }, true);
-
                 editor.addEventListener('keydown', function (e) {
+                    if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+                        var key = e.key ? e.key.toLowerCase() : '';
+                        if (key === 'z') {
+                            e.preventDefault();
+                            document.execCommand(e.shiftKey ? 'redo' : 'undo');
+                            return;
+                        }
+                        if (key === 'y') {
+                            e.preventDefault();
+                            document.execCommand('redo');
+                            return;
+                        }
+                    }
                     if (e.key === 'Escape' && selectedImg)
                         clearSelection();
                     if ((e.key === 'Delete' || e.key === 'Backspace') && selectedImg && imageId(selectedImg)) {
@@ -3238,6 +3228,8 @@ blockquote:not(.mail-quote) {
                     }
                     if (inLockedRegion())
                         return;
+                    /* Link before Space/Enter is inserted so createLink cannot
+                     * swallow the trailing space (regression of a prior fix). */
                     if (e.key === 'Enter' || e.key === ' ')
                         tryAutoLink(true);
                     if (e.key === 'Tab') {
@@ -3248,14 +3240,23 @@ blockquote:not(.mail-quote) {
                     }
                 });
 
+                /* Lists need the space already in the DOM; links are handled on keydown. */
                 editor.addEventListener('input', function (e) {
-                    var paste = e.inputType === 'insertFromPaste';
-                    if (e.inputType && e.inputType !== 'insertText'
-                        && e.inputType !== 'insertCompositionText' && !paste)
+                    if (e.inputType === 'insertFromPaste') {
+                        tryAutoList();
+                        tryAutoLink(true);
+                        notifyImagePresence();
                         return;
-                    tryAutoList();
-                    tryAutoLink(paste);
+                    }
+                    if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+                        tryAutoList();
+                        return;
+                    }
+                    if (e.inputType === 'insertText' && e.data === ' ')
+                        tryAutoList();
                 });
+
+                notifyImagePresence();
             })();
         """;
     }

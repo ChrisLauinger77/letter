@@ -61,9 +61,11 @@ Before you ask, I’m not a professional programmer. I work in a completely diff
 - HTML editor with a compact format toolbar
 - Automatic links for email addresses and URLs; remove a link from the context menu
 - Hunspell spell checking, including “Add to Dictionary” (may require additional package of your choice if not installed)
-- Insert image inline, resize from the editor. You can also insert image by drag-and-drop from your PC
+- Insert image inline, resize from the format toolbar (or the context menu). You can also insert image by drag-and-drop from your PC
 - Address book picker from Online Accounts and recent recipients, drag recipient pills
 - When you reply and add a new recipient, Letter can offer to attach files from the original message
+
+**Compose and laptop power saving.** The composer is an HTML editor based on WebKit (the same engine used to show HTML mail). That is heavier than a plain text field: each keystroke goes through a separate web process, layout, and redraw. On a laptop in **Power Saver**, the system throttles CPU and GPU on purpose, so typing in compose can feel laggy or delayed. That is not a mail-sync bug and not Letter “blocking” a thread. Use **Balanced** or **Performance** while writing long messages. The message *reader* runs with JavaScript disabled; only the composer needs the WebKit editing stack for real HTML mail (bold, quotes, signatures, inline images, paste from other clients).
 
 
 

@@ -56,6 +56,7 @@ public class Mail.FormatToolbar : Gtk.Box {
         formats.append (color_menu_button ());
         formats.append (emoji_button ());
         formats.append (icon_button ("image-x-generic-symbolic", _("Insert Image"), () => insert_image ()));
+        formats.append (this.view.create_image_size_drop ());
         append (formats);
     }
 

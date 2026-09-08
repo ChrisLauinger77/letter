@@ -101,6 +101,8 @@ public class Mail.Window : Adw.ApplicationWindow {
     private Adw.SpinnerPaintable folder_spinner;
     private Adw.SpinnerPaintable conversation_spinner;
     private HashTable<string, GenericArray<Message>> message_cache;
+    private HashTable<string, int64?> message_cache_touched;
+    private HashTable<string, uint> header_cache_save_sources;
     private HashTable<string, GenericArray<Folder>> folder_tree_cache;
     private Gtk.PopoverMenu? context_menu;
     private SimpleActionGroup? context_actions;
@@ -110,11 +112,12 @@ public class Mail.Window : Adw.ApplicationWindow {
     private Message? open_message;
     private Conversation? open_conversation;
     private uint sync_source;
+    private uint idle_bulk_source;
+    private uint idle_bulk_cursor;
     private bool sync_pump_running;
     private bool mailbox_bootstrapping;
     private bool folder_tree_needs_refresh;
     private bool continue_startup_after_tree;
-    private bool warming_trees;
     private HashTable<string, uint8> notified_uids;
     private GenericArray<MailSyncJob> sync_jobs;
     private bool restoring_selection;
@@ -142,6 +145,9 @@ public class Mail.Window : Adw.ApplicationWindow {
     private const int RANK_BACKGROUND = 100;
     private const int RANK_CACHE = 150;
     private const int RANK_CACHE_ALIGN = 500;
+    private const int RANK_IDLE_BULK = 900;
+    private const int IDLE_BULK_FIRST_SECONDS = 45;
+    private const int IDLE_BULK_STEP_SECONDS = 25;
     private SearchQuery search_query = new SearchQuery ();
     private string search_text = "";
     private GenericArray<string> search_tokens = new GenericArray<string> ();
@@ -230,6 +236,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.folder_spinner = new Adw.SpinnerPaintable (this.no_folders_page);
         this.conversation_spinner = new Adw.SpinnerPaintable (this.conversation_page);
         this.message_cache = new HashTable<string, GenericArray<Message>> (str_hash, str_equal);
+        this.message_cache_touched = new HashTable<string, int64?> (str_hash, str_equal);
+        this.header_cache_save_sources = new HashTable<string, uint> (str_hash, str_equal);
         this.folder_tree_cache = new HashTable<string, GenericArray<Folder>> (str_hash, str_equal);
         this.hidden_uids = new HashTable<string, uint8> (str_hash, str_equal);
         this.collapsed_folders = new HashTable<string, uint8> (str_hash, str_equal);
@@ -495,7 +503,6 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         restore_account_selection (previous_uid);
         preload_folder_trees_from_disk ();
-        warm_other_account_trees.begin ();
     }
 
     public void show_toast (string message) {
@@ -560,8 +567,10 @@ public class Mail.Window : Adw.ApplicationWindow {
             if (key.has_prefix (prefix))
                 message_keys.add (key);
         });
-        for (uint i = 0; i < message_keys.length; i++)
+        for (uint i = 0; i < message_keys.length; i++) {
             this.message_cache.remove (message_keys[i]);
+            this.message_cache_touched.remove (message_keys[i]);
+        }
 
         var hidden_keys = new GenericArray<string> ();
         this.hidden_uids.foreach ((key, value) => {
@@ -728,7 +737,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         Account account,
         Folder folder,
         GenericArray<Message> messages,
-        HashTable<string, uint8>? known_uids = null
+        HashTable<string, uint8>? known_uids = null,
+        bool persist_disk = true
     ) {
         var key = message_cache_key (account, folder);
         var previous = this.message_cache.get (key);
@@ -741,6 +751,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
         }
         this.message_cache.set (key, messages);
+        touch_message_cache_key (key);
         int total;
         int unread;
         message_counts (messages, out total, out unread);
@@ -755,10 +766,62 @@ public class Mail.Window : Adw.ApplicationWindow {
         sync_important_markers ();
         if (known.length > 0)
             notify_new_arrivals (account, folder, messages, known);
+        if (persist_disk)
+            queue_header_list_cache_save (account, folder, messages);
+        enforce_message_cache_ceiling ();
     }
 
     private bool folder_skips_body_prefetch (Folder folder) {
-        return folder.kind == FolderKind.JUNK || folder.kind == FolderKind.TRASH;
+        return folder.kind == FolderKind.JUNK
+            || folder.kind == FolderKind.TRASH
+            || folder_is_bulk_storage (folder);
+    }
+
+    /* Bulk storage (Archive/Sent/…) — never auto-walk at startup.
+     * Inbox + its rule-sorted children (watch_new_mail) are the opposite:
+     * they are live incoming mail and must sync like Inbox. */
+    private static bool folder_is_bulk_storage (Folder folder) {
+        return MailSession.folder_is_heavy (folder)
+            || folder.kind == FolderKind.ARCHIVE
+            || folder.kind == FolderKind.ALL
+            || folder.kind == FolderKind.JUNK
+            || folder.kind == FolderKind.TRASH
+            || folder.kind == FolderKind.SENT;
+    }
+
+    private static bool folder_is_incoming_watch (Folder folder) {
+        if (folder.is_virtual_view || folder.is_gmail_namespace)
+            return false;
+        if (folder_is_bulk_storage (folder))
+            return false;
+        return folder.watch_new_mail || folder.kind == FolderKind.INBOX;
+    }
+
+    private static bool folder_skips_startup_bulk (Folder folder) {
+        if (folder_is_incoming_watch (folder))
+            return false;
+        if (folder_is_bulk_storage (folder))
+            return true;
+        if (folder.total > 400)
+            return true;
+        return false;
+    }
+
+    private void enqueue_incoming_folder_sync (int header_rank = RANK_BACKGROUND) {
+        mark_inbox_tree_on_sidebar ();
+        var folders = mailbox_sync_folders ();
+        uint queued = 0;
+        for (uint i = 0; i < folders.length; i++) {
+            var folder = folders[i];
+            if (!folder_is_incoming_watch (folder))
+                continue;
+            enqueue_sync_job (SYNC_KIND_HEADERS, folder, header_rank);
+            if (!folder_skips_body_prefetch (folder))
+                enqueue_sync_job (SYNC_KIND_BODIES, folder, header_rank + 1);
+            queued++;
+        }
+        Utils.sync_log ("incoming watch sync: queued %u inbox-tree folders".printf (queued));
+        pump_sync.begin ();
     }
 
     private async void hydrate_folder_headers (Account account, Folder folder, Cancellable cancellable) {
@@ -770,6 +833,22 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (existing != null && existing.length > 0)
             return;
 
+        /* Prefer Letter's on-disk header list (instant) over walking Camel's
+         * full summary. Server delta comes later via boost/align. */
+        var from_disk = load_header_list_cache (account, folder);
+        if (from_disk != null && from_disk.length > 0) {
+            var live = this.message_cache.get (key);
+            if (live != null && live.length > 0)
+                return;
+            store_folder_messages (account, folder, from_disk, null, false);
+            Utils.sync_log ("disk header cache hit “%s” → %u headers".printf (
+                folder.name,
+                from_disk.length
+            ));
+            return;
+        }
+
+        var t0 = Utils.sync_tick ();
         try {
             var cached = yield this.mail_session.list_messages (
                 account,
@@ -784,9 +863,19 @@ public class Mail.Window : Adw.ApplicationWindow {
             if (live != null && live.length > 0)
                 return;
             store_folder_messages (account, folder, cached);
+            Utils.sync_log ("disk hydrate “%s” %s → %u headers".printf (
+                folder.name,
+                Utils.sync_ms (t0),
+                cached.length
+            ));
         } catch (Error e) {
             if (e is IOError.CANCELLED)
                 return;
+            Utils.sync_log ("disk hydrate “%s” FAILED %s: %s".printf (
+                folder.name,
+                Utils.sync_ms (t0),
+                e.message
+            ));
             debug ("Mailbox headers %s: %s", folder.name, e.message);
         }
     }
@@ -805,10 +894,11 @@ public class Mail.Window : Adw.ApplicationWindow {
         var known = snapshot_uids (cached);
         var current = is_current_folder (folder);
         var t0 = Utils.sync_tick ();
-        Utils.sync_log ("Graph refresh_info “%s” (watch=%s high=%s)".printf (
+        Utils.sync_log ("align “%s” begin (watch=%s high=%s had=%u)".printf (
             folder.name,
             current ? "current" : "bg",
-            high ? "yes" : "no"
+            high ? "yes" : "no",
+            cached != null ? cached.length : 0
         ));
         try {
             var messages = yield this.mail_session.list_messages (
@@ -822,8 +912,26 @@ public class Mail.Window : Adw.ApplicationWindow {
             );
             if (cancellable.is_cancelled () || !is_current_account (account))
                 return;
+            /* Same array reference ⇒ UID set unchanged; flags may still have
+             * been refreshed in-place by merge. Keep badges/UI cache-first. */
+            if (messages == cached) {
+                touch_message_cache_key (key);
+                int total;
+                int unread;
+                message_counts (cached, out total, out unread);
+                folder.unread = unread;
+                folder.total = total;
+                refresh_folder_badge (folder);
+                if (current && this.search_text.length == 0)
+                    queue_conversation_refresh ();
+                Utils.sync_log ("align “%s” unchanged %s (flags/badges refreshed)".printf (
+                    folder.name,
+                    Utils.sync_ms (t0)
+                ));
+                return;
+            }
             store_folder_messages (account, folder, messages, known);
-            Utils.sync_log ("Graph refresh_info “%s” ok %s → %u headers".printf (
+            Utils.sync_log ("align “%s” ok %s → %u headers".printf (
                 folder.name,
                 Utils.sync_ms (t0),
                 messages.length
@@ -831,7 +939,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         } catch (Error e) {
             if (e is IOError.CANCELLED)
                 return;
-            Utils.sync_log ("Graph refresh_info “%s” FAILED %s: %s".printf (folder.name, Utils.sync_ms (t0), e.message));
+            Utils.sync_log ("align “%s” FAILED %s: %s".printf (folder.name, Utils.sync_ms (t0), e.message));
             debug ("Mailbox sync %s: %s", folder.name, e.message);
         }
     }
@@ -900,42 +1008,164 @@ public class Mail.Window : Adw.ApplicationWindow {
     }
 
     private void enqueue_new_mail_sync () {
-        var folders = mailbox_sync_folders ();
-        for (uint i = 0; i < folders.length; i++) {
-            var folder = folders[i];
-            if (folder.watch_new_mail || folder.kind == FolderKind.INBOX)
-                enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_BACKGROUND);
-        }
-        pump_sync.begin ();
+        enqueue_incoming_folder_sync (RANK_BACKGROUND);
     }
 
+    /* After the folder tree is ready: sync the whole Inbox tree (rule folders
+     * included). Bulk folders get a separate idle aligner. */
     private void enqueue_background_after_tree (GenericArray<string> added) {
-        var added_set = new HashTable<string, uint8> (str_hash, str_equal);
-        for (uint i = 0; i < added.length; i++)
-            added_set.set (added[i], 1);
-
-        var inbox = find_folder_kind (FolderKind.INBOX);
-        var inbox_name = inbox != null ? inbox.full_name : null;
-        var folders = mailbox_sync_folders ();
-        Utils.sync_log ("startup background: %u folders, %u new, skip inbox=%s".printf (
-            folders.length,
-            added.length,
-            inbox_name ?? "-"
-        ));
-        for (uint i = 0; i < folders.length; i++) {
-            var folder = folders[i];
-            if (folder.is_virtual_view || folder.is_gmail_namespace)
-                continue;
-            var is_new = added_set.contains (folder.full_name);
-            var header_rank = is_new ? RANK_CACHE : RANK_BACKGROUND;
-            if (inbox_name == null || folder.full_name != inbox_name)
-                enqueue_sync_job (SYNC_KIND_HEADERS, folder, header_rank);
-            if (!folder_skips_body_prefetch (folder))
-                enqueue_sync_job (SYNC_KIND_BODIES, folder, header_rank + 1);
-        }
-        enqueue_cache_align ();
-        pump_sync.begin ();
+        Utils.sync_log (
+            "cache-first: tree ready (%u new folder names) — syncing inbox tree".printf (added.length)
+        );
+        /* High priority inbox tree; other folders wait for the user sync timer. */
+        enqueue_incoming_folder_sync (RANK_SELECTED_HEADERS);
         watch_new_mail_folders.begin ();
+    }
+
+    private void schedule_idle_bulk_align (bool from_startup) {
+        stop_idle_bulk_align ();
+        if (from_startup)
+            Utils.sync_log ("idle bulk align: disabled (cache-first model)");
+    }
+
+    private void stop_idle_bulk_align () {
+        if (this.idle_bulk_source == 0)
+            return;
+        Source.remove (this.idle_bulk_source);
+        this.idle_bulk_source = 0;
+    }
+
+    private bool compose_windows_open () {
+        var app = get_application ();
+        if (app == null)
+            return false;
+        foreach (var window in app.get_windows ()) {
+            var compose = window as ComposeWindow;
+            if (compose != null && compose.visible)
+                return true;
+        }
+        return false;
+    }
+
+    private bool sync_has_priority_work () {
+        if (this.sync_pump_running)
+            return true;
+        for (uint i = 0; i < this.sync_jobs.length; i++) {
+            if (this.sync_jobs[i].rank < RANK_IDLE_BULK)
+                return true;
+        }
+        return false;
+    }
+
+    private bool idle_bulk_align_allowed () {
+        if (this.mailbox_bootstrapping || this.tearing_down)
+            return false;
+        if (compose_windows_open ())
+            return false;
+        if (sync_has_priority_work ())
+            return false;
+        return true;
+    }
+
+    private bool folder_wants_idle_align (Folder folder) {
+        if (folder.is_virtual_view || folder.is_gmail_namespace)
+            return false;
+        if (folder_is_incoming_watch (folder))
+            return false;
+        return true;
+    }
+
+    private bool folder_idle_align_safe (Folder folder) {
+        if (!folder_wants_idle_align (folder))
+            return false;
+        /* Cold bulk folders still freeze on first collect_messages. Idle-align
+         * them only with an existing header cache (RAM/disk → delta), or if small. */
+        if (folder_is_bulk_storage (folder)) {
+            var account = this.selected_account;
+            if (account == null)
+                return false;
+            var key = message_cache_key (account, folder);
+            var cached = this.message_cache.get (key);
+            if (cached == null || cached.length == 0) {
+                var disk = load_header_list_cache (account, folder);
+                if (disk != null && disk.length > 0) {
+                    this.message_cache.set (key, disk);
+                    cached = disk;
+                    Utils.sync_log ("idle bulk: primed “%s” from disk cache (%u)".printf (
+                        folder.name,
+                        disk.length
+                    ));
+                }
+            }
+            if ((cached == null || cached.length == 0) && folder.total > 1500)
+                return false;
+        }
+        return true;
+    }
+
+    private static int idle_bulk_sort_rank (Folder folder) {
+        switch (folder.kind) {
+            case FolderKind.SENT:
+                return 0;
+            case FolderKind.DRAFTS:
+                return 1;
+            case FolderKind.OUTBOX:
+                return 2;
+            case FolderKind.ARCHIVE:
+            case FolderKind.ALL:
+                return 3;
+            case FolderKind.JUNK:
+                return 4;
+            case FolderKind.TRASH:
+                return 5;
+            default:
+                return 6;
+        }
+    }
+
+    private GenericArray<Folder> idle_bulk_candidates () {
+        var folders = mailbox_sync_folders ();
+        var list = new GenericArray<Folder> ();
+        for (uint i = 0; i < folders.length; i++) {
+            if (folder_idle_align_safe (folders[i]))
+                list.add (folders[i]);
+        }
+        list.sort ((a, b) => {
+            int rank = idle_bulk_sort_rank (a) - idle_bulk_sort_rank (b);
+            if (rank != 0)
+                return rank;
+            return a.name.collate (b.name);
+        });
+        return list;
+    }
+
+    private void try_idle_bulk_step () {
+        if (!idle_bulk_align_allowed ()) {
+            Utils.sync_log ("idle bulk align: skipped (compose/busy/priority work)");
+            return;
+        }
+
+        var list = idle_bulk_candidates ();
+        if (list.length == 0) {
+            Utils.sync_log ("idle bulk align: nothing to do");
+            return;
+        }
+
+        if (this.idle_bulk_cursor >= list.length)
+            this.idle_bulk_cursor = 0;
+        var folder = list[this.idle_bulk_cursor];
+        this.idle_bulk_cursor++;
+
+        Utils.sync_log (
+            "idle bulk align: “%s” (kind=%d total=%d) rank=%d".printf (
+                folder.name,
+                (int) folder.kind,
+                folder.total,
+                RANK_IDLE_BULK
+            )
+        );
+        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_IDLE_BULK);
+        pump_sync.begin ();
     }
 
     private void enqueue_cache_align () {
@@ -1155,27 +1385,27 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
-    private async void hydrate_remaining (Account account, Cancellable cancellable) {
-        var folders = mailbox_sync_folders ();
-        for (uint i = 0; i < folders.length; i++) {
-            if (cancellable.is_cancelled () || !is_current_account (account))
-                break;
-            yield hydrate_folder_headers (account, folders[i], cancellable);
-            Idle.add (hydrate_remaining.callback);
-            yield;
-        }
-    }
-
     private async void sync_mailbox (Cancellable cancellable) {
         var account = this.selected_account;
         if (this.mail_session == null || account == null)
             return;
 
         var current = this.selected_folder;
+        if (current == null)
+            return;
+        if (folder_skips_startup_bulk (current)) {
+            Utils.sync_log (
+                "lean startup: skip disk collect for large “%s” (total=%d)".printf (
+                    current.name,
+                    current.total
+                )
+            );
+            return;
+        }
+
         var token = show_sync_status (_("Reading mailbox…"));
         try {
-            if (current != null)
-                yield hydrate_folder_headers (account, current, cancellable);
+            yield hydrate_folder_headers (account, current, cancellable);
         } finally {
             hide_sync_status (token);
         }
@@ -1774,6 +2004,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.idle_cancellable?.cancel ();
         this.idle_cancellable = new Cancellable ();
         this.sync_jobs = new GenericArray<MailSyncJob> ();
+        this.idle_bulk_cursor = 0;
+        stop_idle_bulk_align ();
         this.mail_session?.unwatch_all_folders ();
         bind_reader_mailbox ();
         sync_account_selection (account);
@@ -2176,41 +2408,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
-    private async void warm_other_account_trees () {
-        var app = get_application () as Application;
-        if (app == null || this.mail_session == null || this.warming_trees)
-            return;
-
-        this.warming_trees = true;
-        var current = this.selected_account;
-        try {
-            for (uint i = 0; i < app.accounts.items.get_n_items (); i++) {
-                var account = app.accounts.items.get_item (i) as Account;
-                if (account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
-                    continue;
-                if (current != null && accounts_are_same (current, account))
-                    continue;
-                if (cached_folder_tree (account) != null)
-                    continue;
-
-                try {
-                    var folders = yield this.mail_session.list_folders (account, null, false);
-                    if (folders.length == 0)
-                        continue;
-                    remember_folder_tree (account, folders);
-                    Utils.sync_log ("warmed folder tree for %s (%u folders)".printf (
-                        account.display_name,
-                        folders.length
-                    ));
-                } catch (Error e) {
-                    debug ("Could not warm folder tree %s: %s", account.display_name, e.message);
-                }
-            }
-        } finally {
-            this.warming_trees = false;
-        }
-    }
-
     private static GenericArray<Folder>? load_folder_tree_from_disk_key (string account_uid) {
         var path = MailSession.folder_tree_cache_file (account_uid);
         if (!FileUtils.test (path, FileTest.IS_REGULAR))
@@ -2277,21 +2474,89 @@ public class Mail.Window : Adw.ApplicationWindow {
         apply_folder_tree (folders);
         remember_folder_tree (account, folders);
         mark_inbox_tree_on_sidebar ();
-        warm_other_account_trees.begin ();
 
         if (!restore)
             return;
 
-        if (account.has_mail)
+        if (account.has_mail) {
             this.mailbox_bootstrapping = true;
-        restore_folder_selection ();
-        if (account.has_mail)
-            startup_refresh.begin (cancellable);
-        else
+            present_mailbox_from_cache.begin (account, cancellable);
+        } else {
+            restore_folder_selection ();
             set_conversation_heading (
                 this.selected_folder != null ? this.selected_folder.name : _("Offline"),
                 null
             );
+        }
+    }
+
+    private async void present_mailbox_from_cache (Account account, Cancellable cancellable) {
+        var token = show_sync_status (_("Loading local cache…"));
+        try {
+            yield preload_all_header_lists_from_disk (account, cancellable);
+        } finally {
+            hide_sync_status (token);
+        }
+        if (cancellable.is_cancelled () || !is_current_account (account)) {
+            this.mailbox_bootstrapping = false;
+            return;
+        }
+
+        restore_folder_selection ();
+        startup_refresh.begin (cancellable);
+    }
+
+    private async void preload_all_header_lists_from_disk (Account account, Cancellable cancellable) {
+        var folders = folders_from_tree (false);
+        uint loaded = 0;
+        uint messages = 0;
+        var t0 = Utils.sync_tick ();
+
+        for (uint i = 0; i < folders.length; i++) {
+            if (cancellable.is_cancelled ())
+                return;
+
+            var folder = folders[i];
+            if (folder.is_virtual_view || folder.is_gmail_namespace)
+                continue;
+
+            var key = message_cache_key (account, folder);
+            var existing = this.message_cache.get (key);
+            if (existing != null && existing.length > 0) {
+                touch_message_cache_key (key);
+                continue;
+            }
+
+            var disk = load_header_list_cache (account, folder);
+            if (disk == null || disk.length == 0)
+                continue;
+
+            this.message_cache.set (key, disk);
+            touch_message_cache_key (key);
+            int total;
+            int unread;
+            message_counts (disk, out total, out unread);
+            folder.total = total;
+            folder.unread = unread;
+            refresh_folder_badge (folder);
+            loaded++;
+            messages += disk.length;
+
+            if (i % 2 == 1) {
+                Idle.add (preload_all_header_lists_from_disk.callback);
+                yield;
+            }
+        }
+
+        sync_bookmarks_folder ();
+        sync_important_markers ();
+        enforce_message_cache_ceiling ();
+        Utils.sync_log ("preload header-lists: %u folders, %u messages %s (ceiling %s)".printf (
+            loaded,
+            messages,
+            Utils.sync_ms (t0),
+            format_byte_size (Utils.message_cache_ceiling_bytes ())
+        ));
     }
 
     private async void startup_refresh (Cancellable cancellable) {
@@ -2300,22 +2565,8 @@ public class Mail.Window : Adw.ApplicationWindow {
             if (this.mail_session == null || account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
                 return;
 
-            Utils.sync_log ("startup disk hydrate for %s".printf (account.display_name));
-            yield sync_mailbox (cancellable);
-            if (cancellable.is_cancelled () || !is_current_account (account))
-                return;
-
-            yield hydrate_remaining (account, cancellable);
-            if (cancellable.is_cancelled () || !is_current_account (account))
-                return;
-
+            Utils.sync_log ("cache-first startup for %s".printf (account.display_name));
             this.mailbox_bootstrapping = false;
-            var inbox = find_folder_kind (FolderKind.INBOX);
-            if (inbox != null)
-                boost_folder_sync (inbox);
-            if (this.selected_folder != null
-                && (inbox == null || this.selected_folder.full_name != inbox.full_name))
-                boost_folder_sync (this.selected_folder);
 
             if (this.folder_tree_needs_refresh) {
                 this.folder_tree_needs_refresh = false;
@@ -2447,16 +2698,15 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
         var cached = this.message_cache.get (cache_key);
-        if (cached != null)
+        if (cached != null) {
+            touch_message_cache_key (cache_key);
             display_messages (account, folder, cached);
-        else
+        } else {
             show_conversation_loading (
                 _("Loading Messages"),
-                _("Fetching the list from “%s”…").printf (folder.name)
+                _("Reading the local list for “%s”…").printf (folder.name)
             );
-
-        if (!this.mailbox_bootstrapping)
-            boost_folder_sync (folder);
+        }
 
         try {
             yield this.mail_session.follow_folder (account, folder);
@@ -2466,19 +2716,21 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         if (!is_current_folder (folder))
             return;
-        if (this.message_cache.get (cache_key) != null)
-            return;
 
-        yield hydrate_folder_headers (
-            account,
-            folder,
-            this.idle_cancellable ?? new Cancellable ()
-        );
-        if (!is_current_folder (folder))
-            return;
-        cached = this.message_cache.get (cache_key);
-        if (cached != null)
-            display_messages (account, folder, cached);
+        /* Cache-first: fill from disk/Camel local only. No server boost on click —
+         * the user sync-interval (and send) drive alignment. */
+        if (this.message_cache.get (cache_key) == null) {
+            yield hydrate_folder_headers (
+                account,
+                folder,
+                this.idle_cancellable ?? new Cancellable ()
+            );
+            if (!is_current_folder (folder))
+                return;
+            cached = this.message_cache.get (cache_key);
+            if (cached != null)
+                display_messages (account, folder, cached);
+        }
     }
 
     private void show_bookmarked_messages () {
@@ -2681,6 +2933,386 @@ public class Mail.Window : Adw.ApplicationWindow {
 
     private static string message_cache_key (Account account, Folder folder) {
         return "%s\n%s".printf (account.source_uid ?? account.uid, folder.full_name);
+    }
+
+    private void touch_message_cache_key (string key) {
+        this.message_cache_touched.set (key, Utils.sync_tick ());
+    }
+
+    private static size_t estimate_message_bytes (Message message) {
+        size_t n = 384;
+        if (message.uid != null)
+            n += message.uid.length;
+        if (message.subject != null)
+            n += message.subject.length;
+        if (message.from != null)
+            n += message.from.length;
+        if (message.to != null)
+            n += message.to.length;
+        if (message.cc != null)
+            n += message.cc.length;
+        if (message.preview != null)
+            n += message.preview.length;
+        if (message.search_blob != null)
+            n += message.search_blob.length;
+        if (message.from_blob != null)
+            n += message.from_blob.length;
+        if (message.to_blob != null)
+            n += message.to_blob.length;
+        if (message.conversation_key != null)
+            n += message.conversation_key.length;
+        if (message.msgid_refs != null)
+            n += message.msgid_refs.length * 8;
+        return n;
+    }
+
+    private size_t estimate_message_cache_bytes () {
+        size_t total = 0;
+        var keys = this.message_cache.get_keys ();
+        foreach (var key in keys) {
+            var messages = this.message_cache.get (key);
+            if (messages == null)
+                continue;
+            total += 128 + key.length;
+            for (uint i = 0; i < messages.length; i++)
+                total += estimate_message_bytes (messages[i]);
+        }
+        return total;
+    }
+
+    private bool message_cache_key_is_pinned (string key) {
+        var account = this.selected_account;
+        if (account == null)
+            return false;
+        if (this.selected_folder != null
+            && !this.selected_folder.is_virtual_view
+            && message_cache_key (account, this.selected_folder) == key)
+            return true;
+
+        var folders = folders_from_tree (false);
+        for (uint i = 0; i < folders.length; i++) {
+            var folder = folders[i];
+            if (!folder_is_incoming_watch (folder))
+                continue;
+            if (message_cache_key (account, folder) == key)
+                return true;
+        }
+        return false;
+    }
+
+    private void enforce_message_cache_ceiling () {
+        var ceiling = Utils.message_cache_ceiling_bytes ();
+        var used = estimate_message_cache_bytes ();
+        if (used <= ceiling)
+            return;
+
+        var keys = new GenericArray<string> ();
+        foreach (var key in this.message_cache.get_keys ())
+            keys.add (key);
+
+        for (uint i = 0; i < keys.length; i++) {
+            uint best = i;
+            int64 best_t = cache_touch_time (keys[i]);
+            for (uint j = i + 1; j < keys.length; j++) {
+                int64 t = cache_touch_time (keys[j]);
+                if (t < best_t) {
+                    best = j;
+                    best_t = t;
+                }
+            }
+            if (best != i) {
+                var tmp = keys[i];
+                keys[i] = keys[best];
+                keys[best] = tmp;
+            }
+        }
+
+        uint evicted = 0;
+        uint msgs = 0;
+        for (uint i = 0; i < keys.length && used > ceiling; i++) {
+            var key = keys[i];
+            if (message_cache_key_is_pinned (key))
+                continue;
+            var messages = this.message_cache.get (key);
+            if (messages == null)
+                continue;
+            size_t folder_bytes = 128 + key.length;
+            for (uint j = 0; j < messages.length; j++)
+                folder_bytes += estimate_message_bytes (messages[j]);
+            this.message_cache.remove (key);
+            this.message_cache_touched.remove (key);
+            used = used > folder_bytes ? used - folder_bytes : 0;
+            evicted++;
+            msgs += messages.length;
+        }
+
+        if (evicted > 0) {
+            Utils.sync_log (
+                "message-cache eviction: dropped %u folders (%u headers), now ~%s / ceiling %s".printf (
+                    evicted,
+                    msgs,
+                    format_byte_size (used),
+                    format_byte_size (ceiling)
+                )
+            );
+            sync_bookmarks_folder ();
+        }
+    }
+
+    private int64 cache_touch_time (string key) {
+        return this.message_cache_touched.get (key) ?? (int64) 0;
+    }
+
+    private static string format_byte_size (size_t bytes) {
+        if (bytes >= 1024UL * 1024UL)
+            return "%.0f MiB".printf (bytes / (1024.0 * 1024.0));
+        if (bytes >= 1024UL)
+            return "%.0f KiB".printf (bytes / 1024.0);
+        return "%llu B".printf ((uint64) bytes);
+    }
+
+    private static bool header_list_cache_worth_saving (Folder folder, GenericArray<Message> messages) {
+        return folder_is_bulk_storage (folder) || messages.length >= 200;
+    }
+
+    private void queue_header_list_cache_save (
+        Account account,
+        Folder folder,
+        GenericArray<Message> messages
+    ) {
+        if (!header_list_cache_worth_saving (folder, messages))
+            return;
+        var key = message_cache_key (account, folder);
+        var existing = this.header_cache_save_sources.get (key);
+        if (existing != 0)
+            Source.remove (existing);
+
+        /* Capture snapshots — folder/account may change before the timer fires. */
+        var account_uid = account.source_uid ?? account.uid;
+        var folder_full = folder.full_name;
+        var folder_name = folder.name;
+        var snapshot = new GenericArray<Message> ();
+        for (uint i = 0; i < messages.length; i++)
+            snapshot.add (messages[i]);
+
+        var source = Timeout.add (1500, () => {
+            this.header_cache_save_sources.remove (key);
+            save_header_list_cache (account_uid, folder_full, folder_name, snapshot);
+            return Source.REMOVE;
+        });
+        this.header_cache_save_sources.set (key, source);
+    }
+
+    private static GenericArray<Message>? load_header_list_cache (Account account, Folder folder) {
+        var account_uid = account.source_uid ?? account.uid;
+        var path = MailSession.header_list_cache_file (account_uid, folder.full_name);
+        if (!FileUtils.test (path, FileTest.IS_REGULAR))
+            return null;
+
+        string contents;
+        try {
+            FileUtils.get_contents (path, out contents);
+        } catch (Error e) {
+            debug ("Could not read header list cache: %s", e.message);
+            return null;
+        }
+
+        var lines = contents.split ("\n");
+        if (lines.length < 2 || lines[0] != "letter-headers-v1")
+            return null;
+
+        var outgoing = folder.kind == FolderKind.SENT
+            || folder.kind == FolderKind.DRAFTS
+            || folder.kind == FolderKind.OUTBOX;
+        var messages = new GenericArray<Message> ();
+        for (int i = 1; i < lines.length; i++) {
+            var line = lines[i];
+            if (line.length == 0)
+                continue;
+            var parts = line.split ("\t", 11);
+            if (parts.length < 10 || parts[0].length == 0)
+                continue;
+
+            var flags = int.parse (parts[2]);
+            var subject = header_cache_unescape (parts[4]);
+            var from = header_cache_unescape (parts[5]);
+            var to = header_cache_unescape (parts[6]);
+            var cc = parts.length > 7 ? header_cache_unescape (parts[7]) : "";
+            var preview = parts.length > 8 ? header_cache_unescape (parts[8]) : "";
+            if (preview.length == 0)
+                preview = null;
+            var conversation_key = parts.length > 9 ? header_cache_unescape (parts[9]) : "";
+            if (conversation_key.length == 0)
+                conversation_key = null;
+            var refs_raw = parts.length > 10 ? parts[10] : "";
+
+            var from_blob = new StringBuilder ();
+            Utils.append_search_part (from_blob, from);
+            var to_blob = new StringBuilder ();
+            Utils.append_search_part (to_blob, to);
+            Utils.append_search_part (to_blob, cc);
+            var search = new StringBuilder ();
+            Utils.append_search_part (search, subject);
+            Utils.append_search_part (search, from);
+            Utils.append_search_part (search, to);
+            Utils.append_search_part (search, cc);
+            Utils.append_search_part (search, preview);
+
+            var msg_outgoing = (flags & (1 << 4)) != 0 || outgoing;
+            messages.add (new Message () {
+                uid = parts[0],
+                date = int64.parse (parts[1]),
+                seen = (flags & (1 << 0)) != 0,
+                flagged = (flags & (1 << 1)) != 0,
+                important = (flags & (1 << 2)) != 0 || folder.kind == FolderKind.IMPORTANT,
+                has_attachment = (flags & (1 << 3)) != 0,
+                outgoing = msg_outgoing,
+                local_only = (flags & (1 << 5)) != 0,
+                msgid_hash = uint64.parse (parts[3]),
+                subject = subject,
+                from = from,
+                to = to,
+                cc = cc,
+                preview = preview,
+                conversation_key = conversation_key,
+                msgid_refs = parse_msgid_refs (refs_raw),
+                folder_name = folder.name,
+                folder_full_name = folder.full_name,
+                list_address = msg_outgoing && to.length > 0 ? to : from,
+                from_blob = from_blob.str,
+                to_blob = to_blob.str,
+                search_blob = search.str,
+            });
+        }
+
+        if (messages.length == 0)
+            return null;
+        return messages;
+    }
+
+    private static void save_header_list_cache (
+        string account_uid,
+        string folder_full_name,
+        string folder_name,
+        GenericArray<Message> messages
+    ) {
+        var path = MailSession.header_list_cache_file (account_uid, folder_full_name);
+        var dir = Path.get_dirname (path);
+        try {
+            File.new_for_path (dir).make_directory_with_parents ();
+        } catch (Error e) {
+            if (!(e is IOError.EXISTS)) {
+                debug ("Could not create header list cache dir: %s", e.message);
+                return;
+            }
+        }
+
+        var builder = new StringBuilder ("letter-headers-v1\n");
+        for (uint i = 0; i < messages.length; i++) {
+            var message = messages[i];
+            if (message.uid == null || message.uid.length == 0)
+                continue;
+            if (message.local_only)
+                continue;
+
+            int flags = 0;
+            if (message.seen)
+                flags |= 1 << 0;
+            if (message.flagged)
+                flags |= 1 << 1;
+            if (message.important)
+                flags |= 1 << 2;
+            if (message.has_attachment)
+                flags |= 1 << 3;
+            if (message.outgoing)
+                flags |= 1 << 4;
+
+            builder.append (message.uid);
+            builder.append_c ('\t');
+            builder.append (message.date.to_string ());
+            builder.append_c ('\t');
+            builder.append (flags.to_string ());
+            builder.append_c ('\t');
+            builder.append (message.msgid_hash.to_string ());
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.subject));
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.from));
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.to));
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.cc));
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.preview));
+            builder.append_c ('\t');
+            builder.append (header_cache_escape (message.conversation_key));
+            builder.append_c ('\t');
+            builder.append (format_msgid_refs (message.msgid_refs));
+            builder.append_c ('\n');
+        }
+
+        try {
+            FileUtils.set_contents (path, builder.str);
+            Utils.sync_log ("disk header cache wrote “%s” (%u headers)".printf (
+                folder_name,
+                messages.length
+            ));
+        } catch (Error e) {
+            debug ("Could not write header list cache: %s", e.message);
+        }
+    }
+
+    private static string header_cache_escape (string? raw) {
+        if (raw == null || raw.length == 0)
+            return "";
+        return raw.replace ("\\", "\\\\").replace ("\t", "\\t").replace ("\n", "\\n");
+    }
+
+    private static string header_cache_unescape (string raw) {
+        var builder = new StringBuilder ();
+        var escaped = false;
+        unichar c;
+        int index = 0;
+        while (raw.get_next_char (ref index, out c)) {
+            if (!escaped && c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (escaped) {
+                if (c == 't')
+                    builder.append_c ('\t');
+                else if (c == 'n')
+                    builder.append_c ('\n');
+                else
+                    builder.append_unichar (c);
+                escaped = false;
+                continue;
+            }
+            builder.append_unichar (c);
+        }
+        return builder.str;
+    }
+
+    private static uint64[] parse_msgid_refs (string raw) {
+        if (raw.length == 0)
+            return new uint64[0];
+        var parts = raw.split (",");
+        var refs = new uint64[parts.length];
+        for (int i = 0; i < parts.length; i++)
+            refs[i] = uint64.parse (parts[i]);
+        return refs;
+    }
+
+    private static string format_msgid_refs (uint64[]? refs) {
+        if (refs == null || refs.length == 0)
+            return "";
+        var builder = new StringBuilder ();
+        for (int i = 0; i < refs.length; i++) {
+            if (i > 0)
+                builder.append_c (',');
+            builder.append (refs[i].to_string ());
+        }
+        return builder.str;
     }
 
     private static string hide_key (Account account, Folder folder, string uid) {
@@ -3749,27 +4381,39 @@ public class Mail.Window : Adw.ApplicationWindow {
             shown.folder_name = sent_folder.name;
             var key = message_cache_key (account, sent_folder);
             var cache = this.message_cache.get (key);
-            if (cache != null) {
-                var existing = matching_outgoing_send (cache, shown);
-                if (existing == null) {
-                    var next = new GenericArray<Message> ();
-                    next.add (shown);
-                    for (uint i = 0; i < cache.length; i++)
-                        next.add (cache[i]);
-                    this.message_cache.set (key, next);
-                    cache = next;
-                    if (sent_folder.total >= 0)
-                        sent_folder.total++;
-                    refresh_folder_badge (sent_folder);
-                } else {
-                    Conversation.prune_duplicate_sends (cache);
-                    shown = existing;
-                }
-
-                if (is_current_folder (sent_folder) && this.search_text.length == 0)
-                    display_messages (account, sent_folder, cache);
+            if (cache == null) {
+                cache = new GenericArray<Message> ();
+                this.message_cache.set (key, cache);
             }
+
+            var existing = matching_outgoing_send (cache, shown);
+            if (existing == null) {
+                var next = new GenericArray<Message> ();
+                next.add (shown);
+                for (uint i = 0; i < cache.length; i++)
+                    next.add (cache[i]);
+                this.message_cache.set (key, next);
+                cache = next;
+                bump_folder_total (sent_folder);
+            } else {
+                Conversation.prune_duplicate_sends (cache);
+                shown = existing;
+            }
+
+            touch_message_cache_key (key);
+            queue_header_list_cache_save (account, sent_folder, cache);
+
+            if (is_current_folder (sent_folder) && this.search_text.length == 0)
+                display_messages (account, sent_folder, cache);
+
+            /* Soft Sent align (delta) so the server UID replaces local-sent-* soon. */
+            enqueue_sync_job (SYNC_KIND_HEADERS, sent_folder, RANK_NEW_MAIL);
+            pump_sync.begin ();
         }
+
+        /* Regroup current list so Inbox conversations pick up the Sent copy
+         * via extra_thread_messages. */
+        queue_conversation_refresh ();
 
         var conversation = this.open_conversation;
         if (conversation == null)
@@ -4082,6 +4726,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         for (uint i = 0; i < groups.length; i++) {
             var folder = groups[i].folder;
             var uids = groups[i].uids;
+            /* Local Camel flags + Letter RAM now; server push on sync-interval. */
             this.mail_session.set_uids_flagged.begin (
                 account,
                 folder,
@@ -4097,12 +4742,12 @@ public class Mail.Window : Adw.ApplicationWindow {
                     }
                 }
             );
+            var cache = this.message_cache.get (message_cache_key (account, folder));
+            if (cache != null)
+                queue_header_list_cache_save (account, folder, cache);
         }
 
         if (is_gmail_account ()) {
-            var starred = find_folder_kind (FolderKind.STARRED);
-            if (starred != null && !is_current_folder (starred))
-                boost_folder_sync (starred);
             if (!flagged && this.selected_folder != null && this.selected_folder.kind == FolderKind.STARRED) {
                 for (uint i = 0; i < changed.length; i++)
                     remove_message_from_list (changed[i].uid, changed[i].folder_full_name);
@@ -4123,7 +4768,9 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
 
-        yield hydrate_folder_headers (account, destination, this.idle_cancellable ?? new Cancellable ());
+        /* Prefer disk/RAM for Important — never block the UI on a server copy. */
+        if (this.message_cache.get (message_cache_key (account, destination)) == null)
+            yield hydrate_folder_headers (account, destination, this.idle_cancellable ?? new Cancellable ());
 
         var changed = new GenericArray<Message> ();
         for (uint i = 0; i < messages.length; i++) {
@@ -4145,40 +4792,67 @@ public class Mail.Window : Adw.ApplicationWindow {
         refresh_thread_rows ();
         update_message_actions ();
 
+        var dest_key = message_cache_key (account, destination);
+        var dest_cache = this.message_cache.get (dest_key);
+        if (dest_cache == null) {
+            dest_cache = new GenericArray<Message> ();
+            this.message_cache.set (dest_key, dest_cache);
+        }
+
         for (uint i = 0; i < changed.length; i++) {
             var message = changed[i];
             var folder = folder_for_message (message);
             if (folder == null)
                 continue;
-            try {
-                if (important) {
-                    if (folder.kind == FolderKind.IMPORTANT)
+
+            if (important) {
+                if (folder.kind == FolderKind.IMPORTANT)
+                    continue;
+                if (find_important_uid (message) == null)
+                    dest_cache.add (message);
+                var uids = new GenericArray<string> ();
+                uids.add (message.uid);
+                var copies = new GenericArray<Message> ();
+                copies.add (message);
+                this.mail_session.enqueue_copy_messages (account, folder, destination, uids, copies);
+            } else {
+                var uid = folder.kind == FolderKind.IMPORTANT
+                    ? message.uid
+                    : find_important_uid (message);
+                if (uid == null)
+                    continue;
+                for (uint j = 0; j < dest_cache.length; j++) {
+                    if (dest_cache[j].uid != uid
+                        && !(message.msgid_hash != 0 && dest_cache[j].msgid_hash == message.msgid_hash))
                         continue;
-                    yield this.mail_session.copy_message (account, folder, message.uid, destination);
-                } else {
-                    var source = folder.kind == FolderKind.IMPORTANT
-                        ? folder
-                        : find_important_copy (message);
-                    if (source == null)
-                        continue;
-                    var uid = source.kind == FolderKind.IMPORTANT ? message.uid : find_important_uid (message);
-                    if (uid == null)
-                        continue;
-                    var uids = new GenericArray<string> ();
-                    uids.add (uid);
-                    yield this.mail_session.delete_uids (account, source, uids, null);
-                    if (this.selected_folder != null && this.selected_folder.kind == FolderKind.IMPORTANT)
-                        remove_message_from_list (message.uid, message.folder_full_name);
+                    dest_cache.remove_index (j);
+                    break;
                 }
-            } catch (Error e) {
-                this.toast_overlay.add_toast (new Adw.Toast (e.message) {
-                    timeout = 4,
+                var uids = new GenericArray<string> ();
+                uids.add (uid);
+                this.mail_session.delete_uids.begin (account, destination, uids, null, (obj, res) => {
+                    try {
+                        this.mail_session.delete_uids.end (res);
+                    } catch (Error e) {
+                        debug ("Could not clear Important: %s", e.message);
+                    }
                 });
+                if (this.selected_folder != null && this.selected_folder.kind == FolderKind.IMPORTANT)
+                    remove_message_from_list (message.uid, message.folder_full_name);
             }
+
+            var src_cache = this.message_cache.get (message_cache_key (account, folder));
+            if (src_cache != null)
+                queue_header_list_cache_save (account, folder, src_cache);
         }
 
-        if (!is_current_folder (destination))
-            boost_folder_sync (destination);
+        int total;
+        int unread;
+        message_counts (dest_cache, out total, out unread);
+        destination.total = total;
+        destination.unread = unread;
+        refresh_folder_badge (destination);
+        queue_header_list_cache_save (account, destination, dest_cache);
         sync_important_markers ();
     }
 
@@ -6413,6 +7087,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (this.mail_session == null || account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
             return;
 
+        /* Push local flag/move/copy changes before asking the server for new mail. */
+        this.mail_session.flush_pending_local_changes ();
+
         var full_due = force_tree || this.last_full_align == 0
             || (Utils.sync_tick () - this.last_full_align) >= (int64) FULL_ALIGN_SECONDS * 1000 * 1000;
         if (full_due)
@@ -6477,13 +7154,9 @@ public class Mail.Window : Adw.ApplicationWindow {
                     int total;
                     int unread;
                     message_counts (cached, out total, out unread);
-                    if (MailSession.folder_is_heavy (current[i]) && folders[i].total >= 0) {
-                        current[i].total = folders[i].total;
-                        current[i].unread = folders[i].unread >= 0 ? folders[i].unread : unread;
-                    } else {
-                        current[i].unread = unread;
-                        current[i].total = total;
-                    }
+                    /* Cache-first: trust Letter header lists for badges when present. */
+                    current[i].unread = unread;
+                    current[i].total = total;
                 } else {
                     current[i].unread = folders[i].unread;
                     current[i].total = folders[i].total;
@@ -6511,12 +7184,8 @@ public class Mail.Window : Adw.ApplicationWindow {
                 int total;
                 int unread;
                 message_counts (cached, out total, out unread);
-                if (MailSession.folder_is_heavy (folder) && folder.total >= 0) {
-                    folder.unread = folder.unread >= 0 ? folder.unread : unread;
-                } else {
-                    folder.unread = unread;
-                    folder.total = total;
-                }
+                folder.unread = unread;
+                folder.total = total;
             }
             append_folder_row (folder);
         }
@@ -6618,10 +7287,13 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         this.tearing_down = true;
 
+        this.mail_session?.flush_pending_local_changes ();
+
         if (this.sync_source != 0) {
             Source.remove (this.sync_source);
             this.sync_source = 0;
         }
+        stop_idle_bulk_align ();
         if (this.search_source != 0) {
             Source.remove (this.search_source);
             this.search_source = 0;

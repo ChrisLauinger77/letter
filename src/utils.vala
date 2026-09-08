@@ -42,6 +42,34 @@ namespace Mail.Utils {
         return "%.0f ms".printf ((get_monotonic_time () - start) / 1000.0);
     }
 
+    public static size_t system_memory_total_bytes () {
+        string contents;
+        try {
+            FileUtils.get_contents ("/proc/meminfo", out contents);
+        } catch (Error e) {
+            return 8UL * 1024 * 1024 * 1024;
+        }
+        foreach (var line in contents.split ("\n")) {
+            if (!line.has_prefix ("MemTotal:"))
+                continue;
+            var parts = line.split_set (" \t", 0);
+            foreach (var part in parts) {
+                if (part.length == 0 || part == "MemTotal:" || part.down () == "kb")
+                    continue;
+                var kb = uint64.parse (part);
+                if (kb > 0)
+                    return (size_t) (kb * 1024UL);
+            }
+        }
+        return 8UL * 1024 * 1024 * 1024;
+    }
+
+    /* Soft cap for Letter header lists in RAM (~5% of machine RAM).
+     * Process RSS is usually higher (Camel bodies, WebKit, GTK). */
+    public static size_t message_cache_ceiling_bytes () {
+        return system_memory_total_bytes () / 20;
+    }
+
     public static bool focus_is_text_input (Gtk.Window window) {
         var widget = window.get_focus ();
         while (widget != null) {
