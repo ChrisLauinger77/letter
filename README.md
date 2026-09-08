@@ -4,13 +4,11 @@ Letter is a GTK 4 and libadwaita email client for the GNOME desktop. It sits nex
 
 ![Letter with light, accent, and dark themes](data/screenshots/themes-cover.jpg)
 
-The window title is **Letter**. This is not a GNOME Core application.
+This is not a GNOME Core application, but it follows the clean GNOME 50 look and feel.
 
-I created this application because I love the minimalist, clean, and professional interface of GNOME since version 50, but I couldn't find an email client that lived up to my expectations... until now!
+Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 
-Before you ask, I’m not a professional programmer. I work in a completely different field, but I have a real passion for development and the Linux world in general. I spent months building "Letter" and using it daily before sharing it with the public, and I relied heavily on AI for assistance. So, feel free to try it out and enjoy the app's potential... or not.
-
-**0.9.0-beta.1** is the first public beta. It is already meant for daily use, since I myself am the primary daily user: reading, composing, search, notifications and a lot of optimizations are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. It is non needed!
+**0.9.0-beta.1** is the first public beta. It is already meant for daily use: reading, composing, search, notifications and a lot of optimizations are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter.
 
 ### Available languages
 
@@ -19,11 +17,7 @@ Before you ask, I’m not a professional programmer. I work in a completely diff
 - German (translation by [Christian Lauinger](https://github.com/ChrisLauinger77))
 - More will come — translations via pull request are very welcome.
 
-
-
 ## What the current version does:
-
-
 
 ### Accounts and desktop integration
 
@@ -76,8 +70,6 @@ Before you ask, I’m not a professional programmer. I work in a completely diff
 - When you reply and add a new recipient, Letter can offer to attach files from the original message
 
 **Compose and laptop power saving.** The composer is an HTML editor based on WebKit (the same engine used to show HTML mail). That is heavier than a plain text field: each keystroke goes through a separate web process, layout, and redraw. On a laptop in **Power Saver**, the system throttles CPU and GPU on purpose, so typing in compose can feel laggy or delayed. That is not a mail-sync bug and not Letter “blocking” a thread. Use **Balanced** or **Performance** while writing long messages. The message *reader* runs with JavaScript disabled; only the composer needs the WebKit editing stack for real HTML mail (bold, quotes, signatures, inline images, paste from other clients).
-
-
 
 ### Keyboard
 
@@ -209,6 +201,8 @@ Without GNOME Online Accounts there is nothing to show. That is by design, on an
 - Fedora Workstation 44
 - Ubuntu 26.04.1 LTS
 - openSUSE Tumbleweed
+
+
 
 ## License
 
