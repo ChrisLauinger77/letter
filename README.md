@@ -12,11 +12,12 @@ Before you ask, I’m not a professional programmer. I work in a completely diff
 
 **0.9.0-beta.1** is the first public beta. It is already meant for daily use, since I myself am the primary daily user: reading, composing, search, notifications and a lot of optimizations are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. It is non needed!
 
-### Available language
+### Available languages
 
 - English
 - Italian
-- More will come, if you give me a hand.
+- German (translation by [Christian Lauinger](https://github.com/ChrisLauinger77))
+- More will come — translations via pull request are very welcome.
 
 
 
@@ -45,6 +46,15 @@ Before you ask, I’m not a professional programmer. I work in a completely diff
 - Calendar invitations in the reading pane, with Accept and Reject options
 - Print allowed, and “View image” from the message context menu on inline image
 - Customizable mark as read on selection, after a delay, or never
+
+
+
+### Sync and local cache
+
+- After the first full sync, Letter prefers the **local cache** for folder lists, headers, bookmarks, and unread badges so the UI stays responsive
+- Opening a folder reads from cache; the server is checked on the interval you set in Preferences (and when you refresh), not on every click
+- Flag, bookmark, and similar changes update the UI immediately and are pushed to the server on the next sync cycle
+- Sending mail goes out right away; it does not force a full mailbox refresh
 
 
 
@@ -179,7 +189,9 @@ The Meson `development` profile is only for local work (`meson devenv`). It uses
 
 ## Contributing
 
-Letter is a personal project. I welcome **bug reports, feature requests, and feedback** through [GitHub Issues](https://github.com/stalvatero/letter/issues). I do not accept pull requests at this time — I prefer to keep the codebase under my direct control while the project is young.
+Letter is a personal project. I welcome **bug reports, feature requests, and feedback** through [GitHub Issues](https://github.com/stalvatero/letter/issues).
+
+**Pull requests** are welcome for translations and for small, focused fixes. Larger design or architecture changes are best discussed in an issue first so we stay aligned while the project is young.
 
 ## Where it runs
 

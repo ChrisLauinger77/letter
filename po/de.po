@@ -322,7 +322,7 @@ msgstr ""
 "Ein GNOME-E-Mail-Programm, das Konten mit Kalender und Kontakten teilt."
 
 msgid "translator-credits"
-msgstr "Mitwirkende der deutschen Übersetzung"
+msgstr "Christian Lauinger <christian@lauinger-clan.de>"
 
 msgid "Quit"
 msgstr "Beenden"
