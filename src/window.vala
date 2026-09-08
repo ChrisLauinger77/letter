@@ -124,6 +124,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private string? pending_select_uid;
     private bool tearing_down;
     private HashTable<string, uint8> hidden_uids;
+    private PendingTransferUndo? pending_transfer_undo;
     private HashTable<string, uint8> collapsed_folders;
     private Gtk.SizeGroup account_header_sizes;
     private Gtk.SizeGroup account_row_sizes;
@@ -180,6 +181,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         { "zoom-out", on_zoom_out },
         { "zoom-reset", on_zoom_reset },
         { "fullscreen", on_fullscreen, null, "false" },
+        { "undo", on_undo },
     };
 
     private enum ComposeKind {
@@ -5016,7 +5018,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                 });
                 return;
             }
-            yield transfer_open_message (junk);
+            transfer_open_message (junk);
         } else {
             if (folder == null || folder.kind != FolderKind.JUNK)
                 return;
@@ -5027,7 +5029,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                 });
                 return;
             }
-            yield transfer_open_message (inbox);
+            transfer_open_message (inbox);
         }
     }
 
@@ -5096,7 +5098,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (destination == null)
             return;
 
-        yield transfer_open_message (destination);
+        transfer_open_message (destination);
     }
 
     private async void archive_open_message () {
@@ -5115,7 +5117,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
 
-        yield transfer_open_message (archive);
+        transfer_open_message (archive, true);
     }
 
     private async void delete_open_message () {
@@ -5127,7 +5129,7 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         var trash = find_folder_kind (FolderKind.TRASH);
         if (trash != null && folder.full_name != trash.full_name) {
-            yield transfer_open_message (trash);
+            transfer_open_message (trash);
             return;
         }
 
@@ -5147,98 +5149,14 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
-    private async void transfer_open_message (Folder destination) {
-        var account = this.selected_account;
+    private void transfer_open_message (Folder destination, bool archive_only = false) {
         var message = this.open_message;
-        var folder = folder_for_message (message);
-        if (this.mail_session == null || account == null || folder == null || message == null)
-            return;
-        if (folder.full_name == destination.full_name)
+        if (message == null)
             return;
 
-        var old_uid = message.uid;
-        var old_full = message.folder_full_name;
-        var old_name = message.folder_name;
-        var old_outgoing = message.outgoing;
-        var old_local = message.local_only;
-        var unseen = !message.seen;
-        var conversation = this.open_conversation;
-
-        cancel_mark_seen ();
-        this.hidden_uids.set (hide_key (account, folder, old_uid), 1);
-        remove_from_folder_cache (account, folder, old_uid);
-        if (folder.total > 0)
-            folder.total--;
-        if (unseen && folder.unread > 0)
-            folder.unread--;
-        refresh_folder_badge (folder);
-
-        Conversation.apply_folder (message, destination, null);
-        message.local_only = true;
-        this.mail_session.rekey_body (account, folder, old_uid, destination, old_uid);
-        if (conversation != null)
-            conversation.refresh ();
-        add_to_folder_cache (account, destination, message);
-        destination.total++;
-        if (unseen)
-            destination.unread++;
-        refresh_folder_badge (destination);
-
-        if (conversation != null && conversation.listed_count == 0) {
-            drop_conversation_row (conversation);
-        } else if (conversation != null) {
-            open_listed_message (conversation);
-        }
-
-        try {
-            var new_uid = yield this.mail_session.move_message (account, folder, old_uid, destination);
-            if (new_uid != old_uid) {
-                message.uid = new_uid;
-                this.mail_session.rekey_body (account, destination, old_uid, destination, new_uid);
-                if (this.open_message_uid == old_uid)
-                    this.open_message_uid = new_uid;
-                if (conversation != null)
-                    conversation.refresh ();
-            }
-            restore_folder_counts_from_cache (account, destination);
-            refresh_folder_badge (folder);
-            refresh_folder_badge (destination);
-        } catch (Error e) {
-            this.hidden_uids.remove (hide_key (account, folder, old_uid));
-            Conversation.apply_folder (message, folder, old_uid);
-            message.folder_name = old_name;
-            message.outgoing = old_outgoing;
-            message.local_only = old_local;
-            if (old_full != null)
-                message.folder_full_name = old_full;
-            this.mail_session.rekey_body (account, destination, message.uid, folder, old_uid);
-            remove_from_folder_cache (account, destination, message.uid);
-            add_to_folder_cache (account, folder, message);
-            folder.total++;
-            if (unseen)
-                folder.unread++;
-            if (destination.total > 0)
-                destination.total--;
-            if (unseen && destination.unread > 0)
-                destination.unread--;
-            if (conversation != null) {
-                conversation.refresh ();
-                if (conversation.listed_count > 0) {
-                    this.open_conversation = conversation;
-                    this.open_content = null;
-                    this.open_message = message;
-                    this.open_message_uid = old_uid;
-                    fill_thread_list (conversation, message);
-                    load_message_body.begin (message);
-                }
-            }
-            refresh_folder_badge (folder);
-            refresh_folder_badge (destination);
-            this.toast_overlay.add_toast (new Adw.Toast (e.message) {
-                timeout = 4,
-            });
-            refresh_open_folder.begin (true, false);
-        }
+        var messages = new GenericArray<Message> ();
+        messages.add (message);
+        transfer_messages (messages, destination, archive_only, this.open_conversation != null);
     }
 
     private async void move_selected_messages () {
@@ -5440,8 +5358,12 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (this.mail_session == null || account == null || messages.length == 0)
             return;
 
+        /* Commit any previous undo window so its Camel flush is not lost. */
+        commit_pending_transfer_undo ();
+
         cancel_mark_seen ();
         var groups = new GenericArray<FolderMessageGroup> ();
+        var undo_items = new GenericArray<TransferUndoItem> ();
         var index = new HashTable<string, uint> (str_hash, str_equal);
         uint moved = 0;
         for (uint i = 0; i < messages.length; i++) {
@@ -5466,6 +5388,15 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
             groups[g].uids.add (message.uid);
             groups[g].messages.add (message);
+            undo_items.add (new TransferUndoItem () {
+                message = message,
+                from = from,
+                uid = message.uid,
+                folder_full_name = message.folder_full_name,
+                folder_name = message.folder_name,
+                outgoing = message.outgoing,
+                local_only = message.local_only,
+            });
             apply_local_move (account, message, from, destination);
             moved++;
         }
@@ -5479,17 +5410,143 @@ public class Mail.Window : Adw.ApplicationWindow {
         else
             finish_conversation_bulk ();
 
-        for (uint i = 0; i < groups.length; i++) {
+        for (uint i = 0; i < groups.length; i++)
             refresh_folder_badge (groups[i].folder);
+        refresh_folder_badge (destination);
+
+        /* Keep the Camel move off the flush queue until the toast expires
+         * (or Undo is pressed), so cancel stays a pure local reverse. */
+        var pending = new PendingTransferUndo () {
+            account = account,
+            destination = destination,
+            groups = groups,
+            items = undo_items,
+        };
+        this.pending_transfer_undo = pending;
+        var toast = new Adw.Toast (transfer_undo_title (destination, moved)) {
+            button_label = _("Undo"),
+            timeout = 3,
+            priority = Adw.ToastPriority.HIGH,
+        };
+        pending.toast = toast;
+        toast.button_clicked.connect (() => {
+            if (this.pending_transfer_undo != pending || pending.resolved)
+                return;
+            pending.resolved = true;
+            undo_pending_transfer (pending);
+            this.pending_transfer_undo = null;
+        });
+        toast.dismissed.connect (() => {
+            if (this.pending_transfer_undo != pending || pending.resolved)
+                return;
+            pending.resolved = true;
+            commit_pending_transfer (pending);
+            this.pending_transfer_undo = null;
+        });
+        this.toast_overlay.add_toast (toast);
+    }
+
+    private void on_undo () {
+        var pending = this.pending_transfer_undo;
+        if (pending == null || pending.resolved)
+            return;
+        pending.resolved = true;
+        undo_pending_transfer (pending);
+        this.pending_transfer_undo = null;
+        pending.toast?.dismiss ();
+    }
+
+    private void commit_pending_transfer_undo () {
+        var pending = this.pending_transfer_undo;
+        if (pending == null || pending.resolved)
+            return;
+        pending.resolved = true;
+        commit_pending_transfer (pending);
+        this.pending_transfer_undo = null;
+        pending.toast?.dismiss ();
+    }
+
+    private void commit_pending_transfer (PendingTransferUndo pending) {
+        if (this.mail_session == null)
+            return;
+        for (uint i = 0; i < pending.groups.length; i++) {
             this.mail_session.enqueue_move_messages (
-                account,
-                groups[i].folder,
-                destination,
-                groups[i].uids,
-                groups[i].messages
+                pending.account,
+                pending.groups[i].folder,
+                pending.destination,
+                pending.groups[i].uids,
+                pending.groups[i].messages
             );
         }
-        refresh_folder_badge (destination);
+    }
+
+    private void undo_pending_transfer (PendingTransferUndo pending) {
+        if (this.mail_session == null)
+            return;
+
+        for (uint i = 0; i < pending.items.length; i++)
+            reverse_local_move (pending.account, pending.items[i], pending.destination);
+
+        for (uint i = 0; i < pending.groups.length; i++)
+            refresh_folder_badge (pending.groups[i].folder);
+        refresh_folder_badge (pending.destination);
+        refresh_open_folder.begin (true, false);
+    }
+
+    private string transfer_undo_title (Folder destination, uint count) {
+        if (destination.kind == FolderKind.TRASH) {
+            return ngettext (
+                "Message moved to Trash",
+                "Messages moved to Trash",
+                count
+            );
+        }
+        if (destination.kind == FolderKind.JUNK) {
+            return ngettext (
+                "Message marked as Junk",
+                "Messages marked as Junk",
+                count
+            );
+        }
+        if (destination.is_archive_mailbox
+            || destination.kind == FolderKind.ARCHIVE
+            || destination.kind == FolderKind.ALL) {
+            return ngettext (
+                "Message archived",
+                "Messages archived",
+                count
+            );
+        }
+        return ngettext (
+            "Message moved to “%s”",
+            "Messages moved to “%s”",
+            count
+        ).printf (destination.name);
+    }
+
+    private void reverse_local_move (Account account, TransferUndoItem item, Folder destination) {
+        var message = item.message;
+        var from = item.from;
+        var uid = item.uid;
+        var unseen = !message.seen;
+
+        this.hidden_uids.remove (hide_key (account, from, uid));
+        Conversation.apply_folder (message, from, uid);
+        message.folder_name = item.folder_name;
+        message.outgoing = item.outgoing;
+        message.local_only = item.local_only;
+        if (item.folder_full_name != null)
+            message.folder_full_name = item.folder_full_name;
+        this.mail_session.rekey_body (account, destination, message.uid, from, uid);
+        remove_from_folder_cache (account, destination, message.uid);
+        add_to_folder_cache (account, from, message);
+        from.total++;
+        if (unseen)
+            from.unread++;
+        if (destination.total > 0)
+            destination.total--;
+        if (unseen && destination.unread > 0)
+            destination.unread--;
     }
 
     private void finish_thread_bulk () {
@@ -7088,6 +7145,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         /* Push local flag/move/copy changes before asking the server for new mail. */
+        commit_pending_transfer_undo ();
         this.mail_session.flush_pending_local_changes ();
 
         var full_due = force_tree || this.last_full_align == 0
@@ -7287,6 +7345,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         this.tearing_down = true;
 
+        commit_pending_transfer_undo ();
         this.mail_session?.flush_pending_local_changes ();
 
         if (this.sync_source != 0) {
@@ -7340,6 +7399,25 @@ private class Mail.FolderMessageGroup {
     public Folder folder;
     public GenericArray<Message> messages;
     public GenericArray<string> uids;
+}
+
+private class Mail.TransferUndoItem {
+    public Message message;
+    public Folder from;
+    public string uid;
+    public string? folder_full_name;
+    public string folder_name;
+    public bool outgoing;
+    public bool local_only;
+}
+
+private class Mail.PendingTransferUndo {
+    public Account account;
+    public Folder destination;
+    public GenericArray<FolderMessageGroup> groups;
+    public GenericArray<TransferUndoItem> items;
+    public Adw.Toast? toast;
+    public bool resolved;
 }
 
 private class Mail.MailSyncJob : Object {

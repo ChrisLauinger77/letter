@@ -82,6 +82,7 @@ public class Mail.Application : Adw.Application {
         set_accels_for_action ("win.mark-unread", { "<Ctrl>u" });
         set_accels_for_action ("win.bookmark", { "<Ctrl><Shift>b" });
         set_accels_for_action ("win.delete", { "Delete", "<Ctrl>d" });
+        set_accels_for_action ("win.undo", { "<Ctrl>z" });
         set_accels_for_action ("win.print", { "<Ctrl>p" });
         set_accels_for_action ("win.fullscreen", { "F11" });
         set_accels_for_action ("app.shortcuts", { "<Ctrl>question", "F1" });
@@ -405,6 +406,7 @@ public class Mail.Application : Adw.Application {
         mail.add (new Adw.ShortcutsItem (_("Mark as unread"), "<Ctrl>u"));
         mail.add (new Adw.ShortcutsItem (_("Bookmark"), "<Ctrl><Shift>b"));
         mail.add (new Adw.ShortcutsItem (_("Delete"), "Delete"));
+        mail.add (new Adw.ShortcutsItem (_("Undo"), "<Ctrl>z"));
         mail.add (new Adw.ShortcutsItem (_("Print"), "<Ctrl>p"));
         mail.add (new Adw.ShortcutsItem (_("Zoom In"), "<Ctrl>plus"));
         mail.add (new Adw.ShortcutsItem (_("Zoom Out"), "<Ctrl>minus"));
