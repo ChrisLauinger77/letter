@@ -1,0 +1,65 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build and validate
+    runs-on: ubuntu-24.04
+    # Letter needs GNOME 50 / libadwaita ≥ 1.8. Ubuntu runners are too old;
+    # Fedora 44 matches the platform floor in the README.
+    container:
+      image: fedora:44
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            appstream \
+            blueprint-compiler \
+            desktop-file-utils \
+            evolution-data-server-devel \
+            gcc \
+            gdk-pixbuf2-devel \
+            gettext \
+            gnome-online-accounts-devel \
+            gsound-devel \
+            gtk4-devel \
+            libadwaita-devel \
+            meson \
+            ninja-build \
+            pkgconf-pkg-config \
+            vala \
+            webkitgtk6.0-devel
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure, build, and test
+        run: |
+          meson setup build-ci --buildtype=debug -Dprofile=default
+          meson compile -C build-ci
+          meson test -C build-ci --print-errorlogs
+
+      - name: Validate desktop metadata and translations
+        run: |
+          desktop-file-validate build-ci/data/io.github.stalvatero.Letter.desktop
+          appstreamcli validate --no-net build-ci/data/io.github.stalvatero.Letter.metainfo.xml
+          for catalog in po/*.po; do
+            msgfmt --check "$catalog" -o /dev/null
+          done
+
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-results
+          path: build-ci/meson-logs/testlog.junit.xml
+          if-no-files-found: ignore
