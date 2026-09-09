@@ -117,11 +117,11 @@
 }
 
 .message-action-bar {
-  min-height: 36px;
+  min-height: 28px;
 }
 
 .message-reader .reader-action-row {
-  padding: 2px 12px 4px;
+  padding: 0 12px;
   background: var(--view-bg-color);
 }
 
@@ -132,14 +132,14 @@
 }
 
 .message-action-separator {
-  min-height: 16px;
+  min-height: 14px;
   background: color-mix(in srgb, var(--view-fg-color) 18%, transparent);
 }
 
 .message-action-button {
-  min-width: 28px;
-  min-height: 28px;
-  padding: 4px;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 2px;
 }
 
 headerbar button.compose-send {
@@ -330,6 +330,19 @@ webview.message-body {
   padding: 12px 14px;
   border-radius: 12px;
   background: color-mix(in srgb, var(--accent-bg-color) 12%, var(--view-bg-color));
+}
+
+.priority-badge {
+  margin: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  width: max-content;
+  color: #b42318;
+  background: color-mix(in srgb, #b42318 12%, var(--view-bg-color));
+}
+
+.priority-badge-icon {
+  color: #b42318;
 }
 
 .attachment-chip,

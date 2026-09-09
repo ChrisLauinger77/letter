@@ -121,19 +121,26 @@ public class Mail.SearchQuery : Object {
             return false;
 
         var token = last_token (raw).casefold ();
-        if (token == "contains:" || token == "contiene:") {
-            kind = SearchFilterKind.TEXT;
-            return true;
-        }
-        if (token == "from:" || token == "da:") {
-            kind = SearchFilterKind.FROM;
-            return true;
-        }
-        if (token == "to:" || token == "cc:" || token == "a:") {
-            kind = SearchFilterKind.TO;
-            return true;
-        }
-        return false;
+        if (token.length == 0 || !token.has_suffix (":"))
+            return false;
+
+        SearchFilterKind matched;
+        int after;
+        if (!match_prefix (token, 0, out matched, out after))
+            return false;
+        if (after != token.length)
+            return false;
+        kind = matched;
+        return true;
+    }
+
+    /* Localized operator shown in the search field tooltip (English always works too). */
+    public static string filter_hint () {
+        return _("Search all folders. Filter with %s, %s and %s").printf (
+            C_("Search filter", "contains:"),
+            C_("Search filter", "from:"),
+            C_("Search filter", "to:")
+        );
     }
 
     public static SearchQuery parse (string? raw) {
@@ -271,18 +278,30 @@ public class Mail.SearchQuery : Object {
         kind = SearchFilterKind.TEXT;
         after = start;
         var rest = text.substring (start).casefold ();
-        if (take_prefix (rest, start, "contains:", SearchFilterKind.TEXT, out kind, out after)
-            || take_prefix (rest, start, "contiene:", SearchFilterKind.TEXT, out kind, out after)
-            || take_prefix (rest, start, "from:", SearchFilterKind.FROM, out kind, out after)
-            || take_prefix (rest, start, "da:", SearchFilterKind.FROM, out kind, out after)
-            || take_prefix (rest, start, "to:", SearchFilterKind.TO, out kind, out after)
-            || take_prefix (rest, start, "cc:", SearchFilterKind.TO, out kind, out after)
-            || take_prefix (rest, start, "a:", SearchFilterKind.TO, out kind, out after))
+
+        /* English operators always work. Localized aliases come from gettext
+         * (msgctxt "Search filter"). Longer tokens are tried first. */
+        if (try_prefix (rest, start, "contains:", SearchFilterKind.TEXT, out kind, out after)
+            || try_prefix (rest, start, norm_filter_prefix (C_("Search filter", "contains:")), SearchFilterKind.TEXT, out kind, out after)
+            || try_prefix (rest, start, "from:", SearchFilterKind.FROM, out kind, out after)
+            || try_prefix (rest, start, norm_filter_prefix (C_("Search filter", "from:")), SearchFilterKind.FROM, out kind, out after)
+            || try_prefix (rest, start, "to:", SearchFilterKind.TO, out kind, out after)
+            || try_prefix (rest, start, norm_filter_prefix (C_("Search filter", "to:")), SearchFilterKind.TO, out kind, out after)
+            || try_prefix (rest, start, "cc:", SearchFilterKind.TO, out kind, out after))
             return true;
         return false;
     }
 
-    private static bool take_prefix (
+    private static string norm_filter_prefix (string raw) {
+        var local = raw.casefold ().strip ();
+        if (local.length == 0)
+            return "";
+        if (!local.has_suffix (":"))
+            local += ":";
+        return local;
+    }
+
+    private static bool try_prefix (
         string rest,
         int start,
         string prefix,
@@ -292,7 +311,7 @@ public class Mail.SearchQuery : Object {
     ) {
         kind = SearchFilterKind.TEXT;
         after = start;
-        if (!rest.has_prefix (prefix))
+        if (prefix.length == 0 || !rest.has_prefix (prefix))
             return false;
         kind = matched;
         after = start + prefix.length;

@@ -442,7 +442,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.settings.changed["conversation-view"].connect (on_conversation_view_setting);
         this.message_search.query_changed.connect (on_search_changed);
         this.message_search.stopped.connect (on_search_stopped);
-        this.message_search.tooltip_text = _("Search all folders. Filter with contains:, from: and to:");
+        this.message_search.tooltip_text = SearchQuery.filter_hint ();
         this.message_search.bind_contacts (app.contacts);
         this.settings.changed["mark-as-read"].connect (on_mark_as_read_setting);
 
@@ -3855,9 +3855,15 @@ public class Mail.Window : Adw.ApplicationWindow {
     }
 
     private void apply_seen_flags (GenericArray<Message> messages) {
-        var flags = new HashTable<string, bool> (str_hash, str_equal);
-        for (uint i = 0; i < messages.length; i++)
-            flags.set (message_flag_key (messages[i]), messages[i].seen);
+        var seen = new HashTable<string, bool> (str_hash, str_equal);
+        var flagged = new HashTable<string, bool> (str_hash, str_equal);
+        var important = new HashTable<string, bool> (str_hash, str_equal);
+        for (uint i = 0; i < messages.length; i++) {
+            var key = message_flag_key (messages[i]);
+            seen.set (key, messages[i].seen);
+            flagged.set (key, messages[i].flagged);
+            important.set (key, messages[i].important);
+        }
 
         for (uint i = 0; i < this.message_store.n_items; i++) {
             var conversation = this.message_store.get_item (i) as Conversation;
@@ -3866,11 +3872,17 @@ public class Mail.Window : Adw.ApplicationWindow {
             for (uint j = 0; j < conversation.messages.length; j++) {
                 var message = conversation.messages[j];
                 var key = message_flag_key (message);
-                if (!flags.contains (key))
+                if (!seen.contains (key))
                     continue;
-                var seen = flags.get (key);
-                if (message.seen != seen)
-                    message.seen = seen;
+                var next_seen = seen.get (key);
+                if (message.seen != next_seen)
+                    message.seen = next_seen;
+                var next_flagged = flagged.get (key);
+                if (message.flagged != next_flagged)
+                    message.flagged = next_flagged;
+                var next_important = important.get (key);
+                if (message.important != next_important)
+                    message.important = next_important;
             }
             conversation.refresh ();
         }
@@ -3915,6 +3927,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
 
         apply_seen_flags (cache);
+        if (this.open_message != null)
+            update_message_actions ();
+        refresh_thread_rows ();
         int total;
         int unread;
         message_counts (cache, out total, out unread);
@@ -6257,6 +6272,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             set_win_action_enabled ("mark-spam", false);
             set_win_action_enabled ("print", false);
             sync_action_bars (!any_unread && any_read, any_unread || any_read, false, false, false, false);
+            this.message_reader?.set_priority_badge (false);
             return;
         }
 
@@ -6308,6 +6324,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             outgoing,
             draft
         );
+        this.message_reader?.set_priority_badge (has_message && message.important);
     }
 
     private void sync_action_bars (

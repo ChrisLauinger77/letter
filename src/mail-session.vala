@@ -574,7 +574,7 @@ public class Mail.MailSession : Camel.Session {
         uint added = 0;
         uint gone = 0;
         if (refresh && previous != null && previous.length > 0)
-            messages = merge_folder_messages (camel_folder, folder, previous, out added, out gone);
+            messages = merge_folder_messages (account, camel_folder, folder, previous, out added, out gone);
         if (messages == null) {
             if (refresh && previous != null && previous.length > 0) {
                 Utils.sync_log (
@@ -586,7 +586,7 @@ public class Mail.MailSession : Camel.Session {
                     )
                 );
             }
-            messages = yield collect_messages (camel_folder, folder, cancellable);
+            messages = yield collect_messages (account, camel_folder, folder, cancellable);
         } else {
             merged = true;
         }
@@ -639,7 +639,7 @@ public class Mail.MailSession : Camel.Session {
                 folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS
             );
         }
-        var messages = yield collect_messages (camel_folder, folder, null);
+        var messages = yield collect_messages (account, camel_folder, folder, null);
         apply_counts_from_messages (folder, messages);
         return messages;
     }
@@ -678,7 +678,7 @@ public class Mail.MailSession : Camel.Session {
             var uid = uids[i];
             var info = camel_folder.get_message_info (uid);
             if (info != null) {
-                var message = message_from_info (uid, info, folder, outgoing, camel_folder);
+                var message = message_from_info (account, uid, info, folder, outgoing, camel_folder);
                 if (SearchQuery.matches_message (message, query))
                     messages.add (message);
             }
@@ -1042,6 +1042,7 @@ public class Mail.MailSession : Camel.Session {
     }
 
     private async GenericArray<Message> collect_messages (
+        Account account,
         Camel.Folder camel_folder,
         Folder folder,
         Cancellable? cancellable
@@ -1062,7 +1063,7 @@ public class Mail.MailSession : Camel.Session {
 
             var info = camel_folder.get_message_info (uids[i]);
             if (info != null)
-                messages.add (message_from_info (uids[i], info, folder, outgoing, camel_folder));
+                messages.add (message_from_info (account, uids[i], info, folder, outgoing, camel_folder));
 
             if (i % 48 == 47) {
                 if (total >= 2000 && (i + 1) % 2000 == 0) {
@@ -1097,6 +1098,7 @@ public class Mail.MailSession : Camel.Session {
     }
 
     private GenericArray<Message>? merge_folder_messages (
+        Account account,
         Camel.Folder camel_folder,
         Folder folder,
         GenericArray<Message> previous,
@@ -1131,8 +1133,7 @@ public class Mail.MailSession : Camel.Session {
                 var info = camel_folder.get_message_info (previous[i].uid);
                 if (info == null)
                     continue;
-                previous[i].seen = (info.get_flags () & Camel.MessageFlags.SEEN) != 0;
-                previous[i].flagged = (info.get_flags () & Camel.MessageFlags.FLAGGED) != 0;
+                apply_info_flags (account, folder, previous[i], info);
             }
             return previous;
         }
@@ -1153,16 +1154,14 @@ public class Mail.MailSession : Camel.Session {
             var old = have.get (uid);
             if (old != null) {
                 var info = camel_folder.get_message_info (uid);
-                if (info != null) {
-                    old.seen = (info.get_flags () & Camel.MessageFlags.SEEN) != 0;
-                    old.flagged = (info.get_flags () & Camel.MessageFlags.FLAGGED) != 0;
-                }
+                if (info != null)
+                    apply_info_flags (account, folder, old, info);
                 result.add (old);
             } else {
                 var info = camel_folder.get_message_info (uid);
                 if (info == null)
                     continue;
-                result.add (message_from_info (uid, info, folder, outgoing, camel_folder));
+                result.add (message_from_info (account, uid, info, folder, outgoing, camel_folder));
             }
         }
 
@@ -1235,7 +1234,42 @@ public class Mail.MailSession : Camel.Session {
         return false;
     }
 
+    private static bool uses_outlook_flag_semantics (Account account) {
+        return account.kind == AccountKind.MICROSOFT || account.kind == AccountKind.EXCHANGE;
+    }
+
+    /* evolution-ews maps Graph/EWS High Importance → CAMEL_MESSAGE_FLAGGED, and
+     * Outlook "Flag" (follow-up) → the follow-up user tag. Letter bookmarks must
+     * follow the latter on Microsoft accounts, or Importance shows as a phantom bookmark. */
+    private static bool info_has_active_followup (Camel.MessageInfo info) {
+        var follow = info.dup_user_tag ("follow-up");
+        if (follow == null || follow.length == 0)
+            return false;
+        var completed = info.dup_user_tag ("completed-on");
+        return completed == null || completed.length == 0;
+    }
+
+    private static void apply_info_flags (
+        Account account,
+        Folder folder,
+        Message message,
+        Camel.MessageInfo info
+    ) {
+        var flags = info.get_flags ();
+        message.seen = (flags & Camel.MessageFlags.SEEN) != 0;
+        if (uses_outlook_flag_semantics (account)) {
+            message.flagged = info_has_active_followup (info);
+            message.important = (flags & Camel.MessageFlags.FLAGGED) != 0
+                || folder.kind == FolderKind.IMPORTANT;
+        } else {
+            message.flagged = (flags & Camel.MessageFlags.FLAGGED) != 0;
+            if (folder.kind == FolderKind.IMPORTANT)
+                message.important = true;
+        }
+    }
+
     private static Message message_from_info (
+        Account account,
         string uid,
         Camel.MessageInfo info,
         Folder folder,
@@ -1278,6 +1312,13 @@ public class Mail.MailSession : Camel.Session {
         Utils.append_search_part (to_blob, cc_raw);
         Utils.append_search_part (to_blob, list_address);
 
+        var flags = info.get_flags ();
+        var flagged = uses_outlook_flag_semantics (account)
+            ? info_has_active_followup (info)
+            : (flags & Camel.MessageFlags.FLAGGED) != 0;
+        var important = folder.kind == FolderKind.IMPORTANT
+            || (uses_outlook_flag_semantics (account) && (flags & Camel.MessageFlags.FLAGGED) != 0);
+
         return new Message () {
             uid = uid,
             subject = subject,
@@ -1288,10 +1329,10 @@ public class Mail.MailSession : Camel.Session {
             to_blob = to_blob.str,
             list_address = list_address,
             date = date,
-            seen = (info.get_flags () & Camel.MessageFlags.SEEN) != 0,
-            flagged = (info.get_flags () & Camel.MessageFlags.FLAGGED) != 0,
-            important = folder.kind == FolderKind.IMPORTANT,
-            has_attachment = (info.get_flags () & Camel.MessageFlags.ATTACHMENTS) != 0,
+            seen = (flags & Camel.MessageFlags.SEEN) != 0,
+            flagged = flagged,
+            important = important,
+            has_attachment = (flags & Camel.MessageFlags.ATTACHMENTS) != 0,
             preview = preview,
             folder_name = folder.name,
             folder_full_name = folder.full_name,
@@ -1633,8 +1674,7 @@ public class Mail.MailSession : Camel.Session {
                 continue;
             }
 
-            messages[i].seen = (info.get_flags () & Camel.MessageFlags.SEEN) != 0;
-            messages[i].flagged = (info.get_flags () & Camel.MessageFlags.FLAGGED) != 0;
+            apply_info_flags (account, folder, messages[i], info);
         }
 
         apply_counts_from_messages (folder, messages);
@@ -1661,7 +1701,7 @@ public class Mail.MailSession : Camel.Session {
             var info = watch.camel_folder.get_message_info (uids[i]);
             if (info == null)
                 continue;
-            messages.add (message_from_info (uids[i], info, folder, outgoing, watch.camel_folder));
+            messages.add (message_from_info (account, uids[i], info, folder, outgoing, watch.camel_folder));
             added++;
         }
 
@@ -1761,6 +1801,16 @@ public class Mail.MailSession : Camel.Session {
         Cancellable? cancellable = null
     ) throws Error {
         var camel_folder = yield open_camel_folder (account, folder, cancellable);
+        /* evolution-ews always uploads the full Graph `flag` object with isRead.
+         * If we have no local Flag yet and the summary isn't dirty, refresh so a
+         * remote Outlook Contrassegno is present and not wiped on push. Skip when
+         * local tags are already set/cleared (pending bookmark write). */
+        if (uses_outlook_flag_semantics (account)) {
+            var info = camel_folder.get_message_info (uid);
+            if (info != null && !info_has_active_followup (info) && !info.get_folder_flagged ())
+                yield refresh_folder_info (camel_folder, true);
+        }
+
         var flags = camel_folder.get_message_flags (uid);
         var currently_seen = (flags & Camel.MessageFlags.SEEN) != 0;
         if (currently_seen == seen)
@@ -2280,18 +2330,40 @@ public class Mail.MailSession : Camel.Session {
         var changed = new GenericArray<string> ();
         camel_folder.freeze ();
         try {
-            for (uint i = 0; i < uids.length; i++) {
-                var flags = camel_folder.get_message_flags (uids[i]);
-                var currently = (flags & Camel.MessageFlags.FLAGGED) != 0;
-                if (currently == flagged)
-                    continue;
+            if (uses_outlook_flag_semantics (account)) {
+                for (uint i = 0; i < uids.length; i++) {
+                    var info = camel_folder.get_message_info (uids[i]);
+                    if (info == null)
+                        continue;
+                    if (info_has_active_followup (info) == flagged)
+                        continue;
+                    if (flagged) {
+                        /* Same tag Evolution uses when reading Graph follow-up flags. */
+                        info.set_user_tag ("follow-up", "Follow-up");
+                        info.set_user_tag ("completed-on", null);
+                    } else {
+                        info.set_user_tag ("follow-up", null);
+                        info.set_user_tag ("completed-on", null);
+                        info.set_user_tag ("due-by", null);
+                        info.set_user_tag ("follow-up-start", null);
+                    }
+                    info.set_folder_flagged (true);
+                    changed.add (uids[i]);
+                }
+            } else {
+                for (uint i = 0; i < uids.length; i++) {
+                    var flags = camel_folder.get_message_flags (uids[i]);
+                    var currently = (flags & Camel.MessageFlags.FLAGGED) != 0;
+                    if (currently == flagged)
+                        continue;
 
-                camel_folder.set_message_flags (
-                    uids[i],
-                    Camel.MessageFlags.FLAGGED,
-                    flagged ? Camel.MessageFlags.FLAGGED : 0
-                );
-                changed.add (uids[i]);
+                    camel_folder.set_message_flags (
+                        uids[i],
+                        Camel.MessageFlags.FLAGGED,
+                        flagged ? Camel.MessageFlags.FLAGGED : 0
+                    );
+                    changed.add (uids[i]);
+                }
             }
         } finally {
             camel_folder.thaw ();
@@ -2354,10 +2426,9 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
 
-        const uint BATCH = 3;
-        uint done = 0;
         var t0 = Utils.sync_tick ();
         var logged_pause = false;
+        var done = 0u;
         while (done < job.uids.length) {
             if (this.flag_flush_latest.get (key) != job)
                 return;
@@ -2379,29 +2450,23 @@ public class Mail.MailSession : Camel.Session {
 
             yield enter_camel (false);
             try {
-                var end = done + BATCH;
-                if (end > job.uids.length)
-                    end = job.uids.length;
-                for (uint i = done; i < end; i++) {
-                    try {
-                        yield camel_folder.synchronize_message (job.uids[i], Priority.LOW, null);
-                    } catch (Error e) {
-                        debug ("Could not push flags for %s: %s", job.uids[i], e.message);
-                    }
-                }
-                done = end;
+                /* synchronize_message only downloads bodies. Flag/follow-up/SEEN
+                 * uploads go through folder.synchronize → backend save_flags. */
+                yield camel_folder.synchronize (false, Priority.LOW, null);
+                done = job.uids.length;
+            } catch (Error e) {
+                warning ("Could not push folder flags for “%s”: %s", job.folder.name, e.message);
+                done = job.uids.length;
             } finally {
                 leave_camel (false);
             }
 
-            if (done == job.uids.length || done % 30 == 0) {
-                Utils.sync_log ("flag flush “%s” %u/%u %s".printf (
-                    job.folder.name,
-                    done,
-                    job.uids.length,
-                    Utils.sync_ms (t0)
-                ));
-            }
+            Utils.sync_log ("flag flush “%s” %u/%u %s".printf (
+                job.folder.name,
+                done,
+                job.uids.length,
+                Utils.sync_ms (t0)
+            ));
 
             Idle.add (flush_folder_flags.callback);
             yield;

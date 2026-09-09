@@ -13,6 +13,7 @@ public class Mail.MessageReader : Gtk.Box {
     private RecipientRow cc_row;
     private Adw.WrapBox attachments_box;
     private MessageActionBar header_actions;
+    private Gtk.Box priority_badge;
     private Adw.Banner trust_banner;
     private InvitationBar invitation_bar;
     private WebKit.NetworkSession network_session;
@@ -38,7 +39,7 @@ public class Mail.MessageReader : Gtk.Box {
         vexpand = true;
         this.settings = new Settings (Config.APP_ID);
 
-        var header = new Gtk.Box (Gtk.Orientation.VERTICAL, 6) {
+        var header = new Gtk.Box (Gtk.Orientation.VERTICAL, 2) {
             hexpand = true,
         };
 
@@ -46,20 +47,40 @@ public class Mail.MessageReader : Gtk.Box {
         this.header_actions.add_css_class ("in-reader");
         this.header_actions.halign = Gtk.Align.END;
         this.header_actions.hexpand = true;
+        this.header_actions.valign = Gtk.Align.CENTER;
         this.header_actions.visible = false;
 
-        var actions_row = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 0) {
+        this.priority_badge = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 4) {
+            visible = false,
+            hexpand = false,
+            halign = Gtk.Align.START,
+            valign = Gtk.Align.CENTER,
+        };
+        this.priority_badge.add_css_class ("priority-badge");
+        var priority_icon = new Gtk.Image.from_icon_name ("mail-mark-important-symbolic");
+        priority_icon.add_css_class ("priority-badge-icon");
+        var priority_label = new Gtk.Label (_("Important message")) {
+            xalign = 0,
+            use_markup = false,
+        };
+        priority_label.add_css_class ("caption");
+        this.priority_badge.append (priority_icon);
+        this.priority_badge.append (priority_label);
+
+        var actions_row = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 8) {
             hexpand = true,
+            valign = Gtk.Align.CENTER,
         };
         actions_row.add_css_class ("reader-action-row");
+        actions_row.append (this.priority_badge);
         actions_row.append (this.header_actions);
         header.append (actions_row);
 
-        var meta_block = new Gtk.Box (Gtk.Orientation.VERTICAL, 6) {
+        var meta_block = new Gtk.Box (Gtk.Orientation.VERTICAL, 4) {
             margin_start = 20,
             margin_end = 20,
-            margin_top = 10,
-            margin_bottom = 12,
+            margin_top = 2,
+            margin_bottom = 8,
         };
 
         this.subject_label = new Gtk.Label ("") {
@@ -240,6 +261,10 @@ public class Mail.MessageReader : Gtk.Box {
         this.header_actions.set_important (visible, important);
     }
 
+    public void set_priority_badge (bool show) {
+        this.priority_badge.visible = show;
+    }
+
     public void set_invitation_busy (bool busy) {
         this.invitation_bar.set_busy (busy);
     }
@@ -272,6 +297,7 @@ public class Mail.MessageReader : Gtk.Box {
         this.to_row.visible = false;
         this.cc_row.visible = false;
         this.header_actions.visible = false;
+        this.priority_badge.visible = false;
         this.attachments_box.visible = false;
         this.invitation_bar.bind (null);
         if (message != null) {
@@ -337,6 +363,7 @@ public class Mail.MessageReader : Gtk.Box {
         this.to_row.visible = false;
         this.cc_row.visible = false;
         this.header_actions.visible = false;
+        this.priority_badge.visible = false;
         this.attachments_box.visible = false;
         this.invitation_bar.bind (null);
         this.trust_banner.revealed = false;
@@ -1184,10 +1211,10 @@ public class Mail.MessageActionBar : Gtk.Box {
             valign = Gtk.Align.FILL,
         };
         sep.add_css_class ("message-action-separator");
-        sep.margin_top = 6;
-        sep.margin_bottom = 6;
-        sep.margin_start = 8;
-        sep.margin_end = 8;
+        sep.margin_top = 4;
+        sep.margin_bottom = 4;
+        sep.margin_start = 6;
+        sep.margin_end = 6;
         return sep;
     }
 

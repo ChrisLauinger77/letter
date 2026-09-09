@@ -52,7 +52,18 @@
     <category>Email</category>
   </categories>
   <releases>
-    <release version="@version@" type="development" date="2026-09-08">
+    <release version="@version@" type="development" date="2026-09-09">
+      <description>
+        <p>
+          Second 1.0 release candidate. Completes the German UI translation,
+          fixes Microsoft 365 bookmarks against Outlook Flag (not High
+          Importance), shows a compact badge for high-priority mail, and
+          accepts localized search operators. Also includes calendar
+          invitation timezone and Accept/Decline latency fixes from after rc.1.
+        </p>
+      </description>
+    </release>
+    <release version="1.0.0-rc.1" type="development" date="2026-09-08">
       <description>
         <p>
           First 1.0 release candidate. Daily-use mail with cache-first sync,

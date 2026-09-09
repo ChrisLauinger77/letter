@@ -1,4 +1,4 @@
-# Flatpak manifest for Letter 1.0.0-rc.1 (bundle / GitHub Releases; not Flathub yet).
+# Flatpak manifest for Letter 1.0.0-rc.2 (bundle / GitHub Releases; not Flathub yet).
 # Build libraries for GOA / EDS / Camel into the sandbox; talk to the host
 # Online Accounts and EDS daemons over D-Bus (same pattern as Geary).
 #
