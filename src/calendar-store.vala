@@ -131,7 +131,7 @@ public class Mail.CalendarStore : Object {
             ics = ics,
             uid = uid,
             summary = summary,
-            when_text = format_when (vevent),
+            when_text = format_when (vcal, vevent),
             location = location,
             organizer = organizer,
             kind = kind,
@@ -303,26 +303,95 @@ public class Mail.CalendarStore : Object {
         return root.get_first_component (ICal.ComponentKind.VEVENT_COMPONENT);
     }
 
-    private static string format_when (ICal.Component vevent) {
+    private static string format_when (ICal.Component vcal, ICal.Component vevent) {
         var start = vevent.get_dtstart ();
         var end = vevent.get_dtend ();
         if (start == null || start.is_null_time () || !start.is_valid_time ())
             return "";
 
-        var start_dt = new DateTime.from_unix_local ((int64) start.as_timet ());
+        var start_dt = to_local_datetime (vcal, start);
+        if (start_dt == null)
+            return "";
+
         if (start.is_date ())
             return start_dt.format ("%a %-d %b");
 
         var text = start_dt.format ("%a %-d %b, %H:%M");
         if (end != null && !end.is_null_time () && end.is_valid_time ()) {
-            var end_dt = new DateTime.from_unix_local ((int64) end.as_timet ());
-            if (end_dt.get_day_of_year () == start_dt.get_day_of_year ()
-                && end_dt.get_year () == start_dt.get_year ())
-                text += "–%s".printf (end_dt.format ("%H:%M"));
-            else
-                text += " – %s".printf (end_dt.format ("%a %-d %b, %H:%M"));
+            var end_dt = to_local_datetime (vcal, end);
+            if (end_dt != null) {
+                if (end_dt.get_day_of_year () == start_dt.get_day_of_year ()
+                    && end_dt.get_year () == start_dt.get_year ())
+                    text += "–%s".printf (end_dt.format ("%H:%M"));
+                else
+                    text += " – %s".printf (end_dt.format ("%a %-d %b, %H:%M"));
+            }
         }
         return text;
+    }
+
+    /* DTSTART/DTEND often carry TZID=Europe/Rome without attaching the zone
+     * object. as_timet() then treats wall-clock as UTC and from_unix_local
+     * shifts again (e.g. 16:30 Rome → 18:30). Resolve the zone first. */
+    private static DateTime? to_local_datetime (ICal.Component? vcal, ICal.Time time) {
+        if (time == null || time.is_null_time () || !time.is_valid_time ())
+            return null;
+
+        var zone = resolve_timezone (vcal, time);
+        var epoch = time.as_timet_with_zone (zone);
+        return new DateTime.from_unix_utc ((int64) epoch).to_local ();
+    }
+
+    private static ICal.Timezone resolve_timezone (ICal.Component? vcal, ICal.Time time) {
+        var zone = time.get_timezone ();
+        if (zone != null)
+            return zone;
+
+        var tzid = time.get_tzid ();
+        if (tzid != null && tzid.length > 0) {
+            if (vcal != null) {
+                zone = vcal.get_timezone (tzid);
+                if (zone != null)
+                    return zone;
+            }
+
+            zone = ICal.Timezone.get_builtin_timezone_from_tzid (tzid);
+            if (zone != null)
+                return zone;
+
+            zone = ICal.Timezone.get_builtin_timezone (tzid);
+            if (zone != null)
+                return zone;
+
+            var location = timezone_location_from_tzid (tzid);
+            if (location != null) {
+                zone = ICal.Timezone.get_builtin_timezone (location);
+                if (zone != null)
+                    return zone;
+            }
+        }
+
+        var system = ECal.system_timezone_get_location ();
+        if (system != null && system.length > 0) {
+            zone = ICal.Timezone.get_builtin_timezone (system);
+            if (zone != null)
+                return zone;
+        }
+
+        return ICal.Timezone.get_utc_timezone ();
+    }
+
+    private static string? timezone_location_from_tzid (string tzid) {
+        /* TZID values like "/freeassociation.sourceforge.net/Europe/Rome". */
+        var parts = tzid.split ("/");
+        if (parts.length >= 2) {
+            var continent = parts[parts.length - 2];
+            var city = parts[parts.length - 1];
+            if (continent.length > 0 && city.length > 0
+                && continent.get_char (0).isalpha () && city.get_char (0).isalpha ())
+                return "%s/%s".printf (continent, city);
+        }
+        return null;
     }
 
     private static string mailto_email (string? raw) {

@@ -6195,17 +6195,27 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
 
-        this.message_reader.set_invitation_busy (true);
+        /* Accept/Decline: update UI and trash immediately. Calendar receive/send
+         * (especially Google) can take many seconds — do not block the mailbox. */
+        var leave_mailbox = status != InvitationStatus.TENTATIVE;
+        this.message_reader.show_invitation_status (status);
+        if (leave_mailbox)
+            delete_open_message.begin ();
+        else
+            this.message_reader.set_invitation_busy (true);
+
+        var t0 = Utils.sync_tick ();
         try {
             yield app.calendars.respond (invitation, email, account.source_uid, status, null);
-            this.message_reader.show_invitation_status (status);
-            if (status != InvitationStatus.TENTATIVE)
-                delete_open_message.begin ();
+            Utils.sync_log ("calendar respond %s".printf (Utils.sync_ms (t0)));
         } catch (Error e) {
-            this.message_reader.set_invitation_busy (false);
+            Utils.sync_log ("calendar respond FAILED %s: %s".printf (Utils.sync_ms (t0), e.message));
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 4,
             });
+        } finally {
+            if (!leave_mailbox)
+                this.message_reader.set_invitation_busy (false);
         }
     }
 

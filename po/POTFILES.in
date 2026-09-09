@@ -21,3 +21,9 @@ src/signature-editor.vala
 src/format-toolbar.vala
 src/utils.vala
 src/welcome-dialog.vala
+src/invitation-bar.vala
+src/calendar-store.vala
+src/message-window.vala
+src/dependency-page.vala
+src/contact-store.vala
+src/contact-picker.vala

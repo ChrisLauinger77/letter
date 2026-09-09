@@ -345,15 +345,20 @@ public class Mail.MessageWindow : Adw.ApplicationWindow {
             return;
         }
 
-        reader.set_invitation_busy (true);
+        var leave_mailbox = status != InvitationStatus.TENTATIVE;
+        reader.show_invitation_status (status);
+        if (leave_mailbox)
+            trash_message.begin ();
+        else
+            reader.set_invitation_busy (true);
+
         try {
             yield app.calendars.respond (invitation, email, this.account.source_uid, status, null);
-            reader.show_invitation_status (status);
-            if (status != InvitationStatus.TENTATIVE)
-                trash_message.begin ();
         } catch (Error e) {
-            reader.set_invitation_busy (false);
             toast (e.message);
+        } finally {
+            if (!leave_mailbox)
+                reader.set_invitation_busy (false);
         }
     }
 
