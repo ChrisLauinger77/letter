@@ -1372,7 +1372,8 @@ public class Mail.MailSession : Camel.Session {
             var replacement = matching_live_transfer (live, pending.candidate, claimed);
             if (replacement == null)
                 continue;
-            if (pending.candidate.uid.has_prefix ("local-copy-")) {
+            var copy = pending.candidate.uid.has_prefix ("local-copy-");
+            if (copy) {
                 /* Copies retain their source body. Only promote a body that
                  * was opened under the destination placeholder. */
                 rekey_body (
@@ -1392,7 +1393,10 @@ public class Mail.MailSession : Camel.Session {
                     live.remove_index (j);
             }
             pending.resolved_uid = replacement.uid;
-            if (pending.body_path == null)
+            /* A copy has no recovery snapshot because its source remains in
+             * place. Keep that source→destination mapping until Camel has
+             * durably cached the destination body. */
+            if (pending.body_path == null && !copy)
                 this.pending_body_rekeys.remove_index (i);
             changed = true;
         }

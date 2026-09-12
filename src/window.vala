@@ -6201,6 +6201,19 @@ public class Mail.Window : Adw.ApplicationWindow {
         restore_folder_counts_from_cache (account, from);
         restore_folder_counts_from_cache (account, destination);
         var source_cache = this.message_cache.get (message_cache_key (account, from));
+        if (failed_copy && source_cache != null) {
+            /* These source UIDs were marked Important only for copies that
+             * just failed. Clear the optimistic state before persisting, even
+             * if the user switched accounts while the request was running. */
+            for (uint i = 0; i < uids.length; i++) {
+                for (uint j = 0; j < source_cache.length; j++) {
+                    if (source_cache[j].uid == uids[i])
+                        source_cache[j].important = false;
+                }
+            }
+            if (current)
+                sync_important_markers ();
+        }
         if (source_cache != null)
             save_header_list_cache_now (account, from, source_cache);
         if (destination_cache != null)
@@ -6213,11 +6226,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.toast_overlay.add_toast (new Adw.Toast (error) {
             timeout = 4,
         });
-        if (failed_copy) {
-            /* Removing a failed Gmail Important copy also clears the
-             * optimistic marker on its source message and persisted caches. */
-            sync_important_markers ();
-        }
         if (is_searching && this.search_results != null)
             display_search_results (this.search_results);
         else
