@@ -1978,18 +1978,9 @@ public class Mail.MailSession : Camel.Session {
     public async MessageContent load_message (Account account, Folder folder, string uid, Cancellable? cancellable = null) throws Error {
         var key = body_key (account, folder, uid);
         var cached = this.body_cache.get (key);
-        if (cached != null)
-            return cached;
-
         var pending = resolved_body_rekey (account, folder, uid);
-        if (pending != null) {
-            var durable = load_pending_body (pending);
-            if (durable != null) {
-                var restored = MessageContent.from_mime (uid, durable);
-                this.body_cache.set (key, restored);
-                return restored;
-            }
-        }
+        if (cached != null && pending == null)
+            return cached;
 
         var has_unresolved_rekey = folder_has_pending_body_rekeys (account, folder);
         var defer_online = pending != null || has_unresolved_rekey;
@@ -2001,21 +1992,18 @@ public class Mail.MailSession : Camel.Session {
             var live = yield collect_messages (account, camel_folder, folder, cancellable);
             resolve_pending_body_rekeys (account, folder, live);
             cached = this.body_cache.get (key);
-            if (cached != null)
-                return cached;
             pending = resolved_body_rekey (account, folder, uid);
-            if (pending != null) {
+            if (pending != null)
                 defer_online = true;
-                var durable = load_pending_body (pending);
-                if (durable != null) {
-                    var restored = MessageContent.from_mime (uid, durable);
-                    this.body_cache.set (key, restored);
-                    return restored;
-                }
-            }
         }
         var mime = message_from_local_cache (camel_folder, uid);
         var destination_cached = mime != null;
+        if (destination_cached && pending != null) {
+            finish_body_rekey (pending);
+            pending = null;
+        }
+        if (cached != null)
+            return cached;
         if (mime != null) {
             Utils.sync_log ("open body “%s” uid=%s from disk".printf (folder.name, uid));
         } else if (pending != null) {
@@ -2091,8 +2079,16 @@ public class Mail.MailSession : Camel.Session {
          * local tags are already set/cleared (pending bookmark write). */
         if (uses_outlook_flag_semantics (account)) {
             var info = camel_folder.get_message_info (uid);
-            if (info != null && !info_has_active_followup (info) && !info.get_folder_flagged ())
-                yield refresh_folder_info (camel_folder, true);
+            if (info != null && !info_has_active_followup (info) && !info.get_folder_flagged ()) {
+                try {
+                    yield refresh_folder_info (camel_folder, true);
+                } catch (Error e) {
+                    /* Scheduled auto-marking already updated the UI. Preserve
+                     * the prior best-effort behavior and queue the local SEEN
+                     * flag instead of leaving client/server state split. */
+                    debug ("Could not refresh Microsoft flags before marking read: %s", e.message);
+                }
+            }
         }
 
         var flags = camel_folder.get_message_flags (uid);
