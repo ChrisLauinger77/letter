@@ -1351,6 +1351,11 @@ public class Mail.MailSession : Camel.Session {
                 continue;
             rekey_body (account, pending.from, pending.uid, folder, replacement.uid);
             claimed.set (replacement.uid, 1);
+            for (int j = (int) live.length - 1; j >= 0; j--) {
+                if (live[j].is_placeholder
+                    && live[j].uid == pending.candidate.uid)
+                    live.remove_index (j);
+            }
             if (pending.body_path == null)
                 this.pending_body_rekeys.remove_index (i);
             else
