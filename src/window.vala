@@ -5124,9 +5124,10 @@ public class Mail.Window : Adw.ApplicationWindow {
                         && !(message.msgid_hash != 0 && dest_cache[j].msgid_hash == message.msgid_hash))
                         continue;
                     removed_copy = dest_cache[j];
-                    dest_cache.remove_index (j);
                     break;
                 }
+                if (removed_copy != null)
+                    removed_copy.pending_important_removal = true;
                 delete_important_copy.begin (
                     account,
                     folder,
@@ -5164,13 +5165,68 @@ public class Mail.Window : Adw.ApplicationWindow {
     ) {
         if (this.mail_session == null)
             return;
-        var uids = new GenericArray<string> ();
-        uids.add (uid);
+        var placeholder_uid = uid.has_prefix ("local-copy-") ? uid : null;
         try {
+            if (placeholder_uid != null) {
+                /* Never send a window-local placeholder UID to Camel. Wait for
+                 * its queued copy, then use COPYUID or a refreshed unique match. */
+                yield this.mail_session.flush_pending_local_changes ();
+                if (removed_copy != null && !removed_copy.uid.has_prefix ("local-copy-")) {
+                    uid = removed_copy.uid;
+                } else {
+                    var resolved = yield this.mail_session.find_matching_uid (
+                        account,
+                        destination,
+                        source
+                    );
+                    if (resolved == null) {
+                        /* A failed queued copy already achieved the requested
+                         * unimportant state. An unresolved successful copy must
+                         * remain visible until it can be identified safely. */
+                        if (this.mail_session.has_pending_transfer (
+                            account,
+                            destination,
+                            placeholder_uid
+                        )) {
+                            throw new IOError.NOT_FOUND (
+                                _("This message is still syncing with the server. Try again in a moment.")
+                            );
+                        }
+                        return;
+                    }
+                    uid = resolved;
+                }
+            }
+
+            var uids = new GenericArray<string> ();
+            uids.add (uid);
             yield this.mail_session.delete_uids (account, destination, uids, null);
+            if (placeholder_uid != null) {
+                this.mail_session.discard_pending_transfer (
+                    account,
+                    destination,
+                    placeholder_uid
+                );
+            }
+            if (removed_copy != null)
+                remove_from_folder_cache (account, destination, removed_copy.uid);
+            if (placeholder_uid != null)
+                remove_from_folder_cache (account, destination, placeholder_uid);
+            remove_from_folder_cache (account, destination, uid);
+
+            var destination_cache = this.message_cache.get (
+                message_cache_key (account, destination)
+            );
+            if (destination_cache != null)
+                save_header_list_cache_now (account, destination, destination_cache);
+            if (is_current_account (account)) {
+                refresh_folder_badge (destination);
+                sync_important_markers ();
+            }
         } catch (Error e) {
             debug ("Could not clear Important: %s", e.message);
             if (removed_copy != null) {
+                removed_copy.pending_important_removal = false;
                 removed_copy.important = true;
                 add_to_folder_cache (account, destination, removed_copy);
             }
@@ -5217,7 +5273,22 @@ public class Mail.Window : Adw.ApplicationWindow {
         var cached = this.message_cache.get (message_cache_key (account, folder));
         if (cached == null)
             return null;
-        return MailSession.matching_message_uid (cached, message);
+        var uid = MailSession.matching_message_uid (cached, message);
+        if (uid != null)
+            return uid;
+
+        /* A deferred copy has no server UID yet, but it retains the exact
+         * source identity so toggling Important off can order after that copy. */
+        for (uint i = 0; i < cached.length; i++) {
+            var candidate = cached[i];
+            if (!candidate.uid.has_prefix ("local-copy-")
+                || candidate.transfer_source_uid != message.uid
+                || (candidate.transfer_source_folder ?? "")
+                    != (message.folder_full_name ?? ""))
+                continue;
+            return candidate.uid;
+        }
+        return null;
     }
 
     private void sync_important_markers () {
@@ -5233,6 +5304,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         var cached = this.message_cache.get (message_cache_key (account, important));
         if (cached != null) {
             for (uint i = 0; i < cached.length; i++) {
+                if (cached[i].pending_important_removal)
+                    continue;
                 cached[i].important = true;
                 if (cached[i].msgid_hash != 0)
                     hashes.set (cached[i].msgid_hash.to_string (), 1);
@@ -6046,6 +6119,8 @@ public class Mail.Window : Adw.ApplicationWindow {
             conversation_key = source.conversation_key,
             search_blob = source.search_blob,
             local_only = true,
+            transfer_source_uid = source.uid,
+            transfer_source_folder = source.folder_full_name,
         };
     }
 

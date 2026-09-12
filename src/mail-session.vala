@@ -1434,6 +1434,24 @@ public class Mail.MailSession : Camel.Session {
         return null;
     }
 
+    public bool has_pending_transfer (
+        Account account,
+        Folder folder,
+        string candidate_uid
+    ) {
+        return pending_body_rekey (account, folder, candidate_uid) != null;
+    }
+
+    public void discard_pending_transfer (
+        Account account,
+        Folder folder,
+        string candidate_uid
+    ) {
+        var pending = pending_body_rekey (account, folder, candidate_uid);
+        if (pending != null)
+            finish_body_rekey (pending);
+    }
+
     private void finish_body_rekey (PendingBodyRekey pending) {
         for (int i = (int) this.pending_body_rekeys.length - 1; i >= 0; i--) {
             if (this.pending_body_rekeys[i] != pending)
@@ -3004,6 +3022,12 @@ public class Mail.MailSession : Camel.Session {
                     folder_name = from_name,
                     folder_full_name = from_full_name,
                     list_address = "",
+                    transfer_source_uid = stored_candidate_uid.has_prefix ("local-copy-")
+                        ? stored_uid
+                        : null,
+                    transfer_source_folder = stored_candidate_uid.has_prefix ("local-copy-")
+                        ? from_full_name
+                        : null,
                 };
                 var pending = new PendingBodyRekey () {
                     account_key = state.get_string (group, "account"),
