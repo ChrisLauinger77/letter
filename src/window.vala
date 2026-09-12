@@ -5102,22 +5102,23 @@ public class Mail.Window : Adw.ApplicationWindow {
                     : find_important_uid (message);
                 if (uid == null)
                     continue;
+                Message? removed_copy = null;
                 for (uint j = 0; j < dest_cache.length; j++) {
                     if (dest_cache[j].uid != uid
                         && !(message.msgid_hash != 0 && dest_cache[j].msgid_hash == message.msgid_hash))
                         continue;
+                    removed_copy = dest_cache[j];
                     dest_cache.remove_index (j);
                     break;
                 }
-                var uids = new GenericArray<string> ();
-                uids.add (uid);
-                this.mail_session.delete_uids.begin (account, destination, uids, null, (obj, res) => {
-                    try {
-                        this.mail_session.delete_uids.end (res);
-                    } catch (Error e) {
-                        debug ("Could not clear Important: %s", e.message);
-                    }
-                });
+                delete_important_copy.begin (
+                    account,
+                    folder,
+                    message,
+                    destination,
+                    uid,
+                    removed_copy
+                );
                 if (this.selected_folder != null && this.selected_folder.kind == FolderKind.IMPORTANT)
                     remove_message_from_list (message.uid, message.folder_full_name);
             }
@@ -5135,6 +5136,54 @@ public class Mail.Window : Adw.ApplicationWindow {
         refresh_folder_badge (destination);
         queue_header_list_cache_save (account, destination, dest_cache);
         sync_important_markers ();
+    }
+
+    private async void delete_important_copy (
+        Account account,
+        Folder source_folder,
+        Message source,
+        Folder destination,
+        string uid,
+        Message? removed_copy
+    ) {
+        if (this.mail_session == null)
+            return;
+        var uids = new GenericArray<string> ();
+        uids.add (uid);
+        try {
+            yield this.mail_session.delete_uids (account, destination, uids, null);
+        } catch (Error e) {
+            debug ("Could not clear Important: %s", e.message);
+            if (removed_copy != null) {
+                removed_copy.important = true;
+                add_to_folder_cache (account, destination, removed_copy);
+            }
+            source.important = true;
+            restore_folder_counts_from_cache (account, destination);
+            refresh_folder_badge (destination);
+
+            if (is_current_account (account)) {
+                sync_important_markers ();
+                source.important = true;
+                this.open_conversation?.refresh ();
+                refresh_thread_rows ();
+                update_message_actions ();
+                if (is_searching && this.search_results != null)
+                    display_search_results (this.search_results);
+                else
+                    redisplay_current_list ();
+                this.toast_overlay.add_toast (new Adw.Toast (e.message) {
+                    timeout = 4,
+                });
+            }
+
+            var source_cache = this.message_cache.get (message_cache_key (account, source_folder));
+            if (source_cache != null)
+                save_header_list_cache_now (account, source_folder, source_cache);
+            var destination_cache = this.message_cache.get (message_cache_key (account, destination));
+            if (destination_cache != null)
+                save_header_list_cache_now (account, destination, destination_cache);
+        }
     }
 
     private Folder? find_important_copy (Message message) {
@@ -6928,9 +6977,13 @@ public class Mail.Window : Adw.ApplicationWindow {
             save_header_list_cache_now (account, folder, empty);
         } catch (Error e) {
             if (cache != null) {
+                this.message_cache.set (key, cache);
                 for (uint i = 0; i < cache.length; i++)
                     this.hidden_uids.remove (hide_key (account, folder, cache[i].uid));
+                restore_folder_counts_from_cache (account, folder);
             }
+            refresh_folder_badge (folder);
+            sync_bookmarks_folder ();
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 5,
             });

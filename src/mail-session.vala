@@ -2386,7 +2386,6 @@ public class Mail.MailSession : Camel.Session {
                     Camel.MessageFlags.DELETED,
                     Camel.MessageFlags.DELETED
                 );
-                drop_body (account, folder, uids[i]);
             }
         } finally {
             camel_folder.thaw ();
@@ -2409,6 +2408,8 @@ public class Mail.MailSession : Camel.Session {
             apply_camel_counts (folder, camel_folder);
             throw e;
         }
+        for (uint i = 0; i < uids.length; i++)
+            drop_body (account, folder, uids[i]);
         apply_camel_counts (folder, camel_folder);
     }
 
@@ -2433,7 +2434,6 @@ public class Mail.MailSession : Camel.Session {
                     Camel.MessageFlags.DELETED,
                     Camel.MessageFlags.DELETED
                 );
-                drop_body (account, folder, raw[i]);
                 uids.add (raw[i]);
             }
         } finally {
@@ -2457,6 +2457,8 @@ public class Mail.MailSession : Camel.Session {
             apply_camel_counts (folder, camel_folder);
             throw e;
         }
+        for (uint i = 0; i < uids.length; i++)
+            drop_body (account, folder, uids[i]);
         folder.unread = 0;
         folder.total = 0;
     }
