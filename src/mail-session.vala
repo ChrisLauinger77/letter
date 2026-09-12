@@ -1309,6 +1309,17 @@ public class Mail.MailSession : Camel.Session {
         }
     }
 
+    private bool folder_has_pending_body_rekeys (Account account, Folder folder) {
+        var account_key = account.source_uid ?? account.uid;
+        for (uint i = 0; i < this.pending_body_rekeys.length; i++) {
+            var pending = this.pending_body_rekeys[i];
+            if (pending.account_key == account_key
+                && pending.destination.full_name == folder.full_name)
+                return true;
+        }
+        return false;
+    }
+
     private static Message? matching_live_transfer (
         GenericArray<Message> live,
         Message candidate,
@@ -1859,19 +1870,15 @@ public class Mail.MailSession : Camel.Session {
             return cached;
 
         var camel_folder = yield open_camel_folder (account, folder, null);
-        if (this.pending_body_rekeys.length > 0) {
-            var info = camel_folder.get_message_info (uid);
-            if (info != null && !message_info_is_deleted (info)) {
-                var outgoing = folder.kind == FolderKind.SENT
-                    || folder.kind == FolderKind.DRAFTS
-                    || folder.kind == FolderKind.OUTBOX;
-                var live = new GenericArray<Message> ();
-                live.add (message_from_info (account, uid, info, folder, outgoing, camel_folder));
-                resolve_pending_body_rekeys (account, folder, live);
-                cached = this.body_cache.get (key);
-                if (cached != null)
-                    return cached;
-            }
+        if (folder_has_pending_body_rekeys (account, folder)) {
+            /* A singleton candidate cannot establish uniqueness: the folder
+             * may already contain another message with the same Message-ID or
+             * fallback fingerprint. Resolve only against the complete summary. */
+            var live = yield collect_messages (account, camel_folder, folder, cancellable);
+            resolve_pending_body_rekeys (account, folder, live);
+            cached = this.body_cache.get (key);
+            if (cached != null)
+                return cached;
         }
         var mime = message_from_local_cache (camel_folder, uid);
         if (mime != null)

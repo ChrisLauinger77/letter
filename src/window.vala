@@ -5573,31 +5573,44 @@ public class Mail.Window : Adw.ApplicationWindow {
         else
             finish_conversation_bulk ();
 
-        for (uint i = 0; i < groups.length; i++) {
-            var folder = groups[i].folder;
-            var uids = groups[i].uids;
-            this.mail_session.delete_uids.begin (
-                account,
-                folder,
-                uids,
-                null,
-                (obj, res) => {
-                    try {
-                        this.mail_session.delete_uids.end (res);
-                        refresh_folder_badge (folder);
-                        var cache = this.message_cache.get (message_cache_key (account, folder));
-                        if (cache != null)
-                            save_header_list_cache_now (account, folder, cache);
-                    } catch (Error e) {
-                        for (uint j = 0; j < uids.length; j++)
-                            this.hidden_uids.remove (hide_key (account, folder, uids[j]));
-                        this.toast_overlay.add_toast (new Adw.Toast (e.message) {
-                            timeout = 4,
-                        });
-                        refresh_open_folder.begin (true, false);
-                    }
-                }
-            );
+        for (uint i = 0; i < groups.length; i++)
+            delete_message_group.begin (account, groups[i]);
+    }
+
+    private async void delete_message_group (Account account, FolderMessageGroup group) {
+        if (this.mail_session == null)
+            return;
+        var folder = group.folder;
+        try {
+            yield this.mail_session.delete_uids (account, folder, group.uids, null);
+            refresh_folder_badge (folder);
+            var cache = this.message_cache.get (message_cache_key (account, folder));
+            if (cache != null)
+                save_header_list_cache_now (account, folder, cache);
+        } catch (Error e) {
+            for (uint i = 0; i < group.uids.length; i++)
+                this.hidden_uids.remove (hide_key (account, folder, group.uids[i]));
+            for (uint i = 0; i < group.messages.length; i++) {
+                add_to_folder_cache (account, folder, group.messages[i]);
+                restore_to_search_results (group.messages[i]);
+            }
+            var cache = this.message_cache.get (message_cache_key (account, folder));
+            if (cache != null) {
+                sort_messages_by_date (cache);
+                save_header_list_cache_now (account, folder, cache);
+            }
+            restore_folder_counts_from_cache (account, folder);
+            refresh_folder_badge (folder);
+
+            if (is_current_account (account)) {
+                if (is_searching && this.search_results != null)
+                    display_search_results (this.search_results);
+                else
+                    redisplay_current_list ();
+                this.toast_overlay.add_toast (new Adw.Toast (e.message) {
+                    timeout = 4,
+                });
+            }
         }
     }
 
