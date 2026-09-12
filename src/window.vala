@@ -6033,6 +6033,20 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
+    private void restore_to_search_results (Message message) {
+        if (this.search_results == null)
+            return;
+        for (uint i = 0; i < this.search_results.length; i++) {
+            if (this.search_results[i].uid == message.uid
+                && (this.search_results[i].folder_full_name ?? "")
+                    == (message.folder_full_name ?? ""))
+                return;
+        }
+        this.search_results.add (message);
+        sort_messages_by_date (this.search_results);
+        trim_search_results (this.search_results);
+    }
+
     private void on_transfer_completed (Account account, Folder from, Folder destination) {
         var source_cache = this.message_cache.get (message_cache_key (account, from));
         if (source_cache != null)
@@ -6080,22 +6094,33 @@ public class Mail.Window : Adw.ApplicationWindow {
         var failed_copy = false;
         if (messages != null) {
             for (uint i = 0; i < messages.length; i++) {
-                if (messages[i].uid.has_prefix ("local-copy-"))
+                var message = messages[i];
+                var placeholder_uid = message.uid;
+                var copy = placeholder_uid.has_prefix ("local-copy-");
+                if (copy)
                     failed_copy = true;
                 if (i < uids.length) {
                     this.mail_session.rekey_body (
                         account,
                         destination,
-                        messages[i].uid,
+                        placeholder_uid,
                         from,
                         uids[i]
                     );
+                    if (!copy) {
+                        Conversation.apply_folder (message, from, uids[i]);
+                        message.local_only = false;
+                        add_to_folder_cache (account, from, message);
+                        restore_to_search_results (message);
+                    }
                 }
-                remove_from_folder_cache (account, destination, messages[i].uid);
-                remove_from_search_results (messages[i].uid, destination.full_name);
+                remove_from_folder_cache (account, destination, placeholder_uid);
+                remove_from_search_results (placeholder_uid, destination.full_name);
             }
         }
+        restore_folder_counts_from_cache (account, from);
         restore_folder_counts_from_cache (account, destination);
+        refresh_folder_badge (from);
         refresh_folder_badge (destination);
         this.toast_overlay.add_toast (new Adw.Toast (error) {
             timeout = 4,
@@ -6107,12 +6132,16 @@ public class Mail.Window : Adw.ApplicationWindow {
             /* Removing a failed Gmail Important copy also clears the
              * optimistic marker on its source message and persisted caches. */
             sync_important_markers ();
-            var source_cache = this.message_cache.get (message_cache_key (account, from));
-            if (source_cache != null)
-                save_header_list_cache_now (account, from, source_cache);
-            if (destination_cache != null)
-                save_header_list_cache_now (account, destination, destination_cache);
         }
+        var source_cache = this.message_cache.get (message_cache_key (account, from));
+        if (source_cache != null)
+            save_header_list_cache_now (account, from, source_cache);
+        if (destination_cache != null)
+            save_header_list_cache_now (account, destination, destination_cache);
+        if (is_searching && this.search_results != null)
+            display_search_results (this.search_results);
+        else
+            redisplay_current_list ();
         enqueue_sync_job (SYNC_KIND_HEADERS, from, RANK_SELECTED_HEADERS);
         if (from.full_name != destination.full_name && destination_cache != null)
             enqueue_sync_job (SYNC_KIND_HEADERS, destination, RANK_SELECTED_HEADERS);

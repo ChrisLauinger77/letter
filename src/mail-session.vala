@@ -6,6 +6,14 @@ private class Mail.FolderWatch : Object {
     public uint idle;
 }
 
+private class Mail.PendingBodyRekey : Object {
+    public string account_key;
+    public Folder from;
+    public string uid;
+    public Folder destination;
+    public Message candidate;
+}
+
 public class Mail.MailSession : Camel.Session {
     public E.SourceRegistry registry { get; construct; }
 
@@ -20,6 +28,7 @@ public class Mail.MailSession : Camel.Session {
     private GenericArray<TransferFlushJob> transfer_flush_queue;
     private HashTable<string, uint> transfer_pending;
     private bool transfer_flush_running;
+    private GenericArray<PendingBodyRekey> pending_body_rekeys;
     private HashTable<string, FolderWatch> folder_watches;
     private HashTable<string, int> prefetch_cursor;
     private bool camel_busy;
@@ -84,6 +93,7 @@ public class Mail.MailSession : Camel.Session {
         this.flag_flush_retries = new HashTable<string, FlagFlushJob> (str_hash, str_equal);
         this.transfer_flush_queue = new GenericArray<TransferFlushJob> ();
         this.transfer_pending = new HashTable<string, uint> (str_hash, str_equal);
+        this.pending_body_rekeys = new GenericArray<PendingBodyRekey> ();
         this.folder_watches = new HashTable<string, FolderWatch> (str_hash, str_equal);
         this.prefetch_cursor = new HashTable<string, int> (str_hash, str_equal);
     }
@@ -630,6 +640,7 @@ public class Mail.MailSession : Camel.Session {
 
         apply_counts_from_messages (folder, messages);
         messages = retain_local_only (account, folder, messages, previous);
+        resolve_pending_body_rekeys (account, folder, messages);
         Conversation.prune_duplicate_sends (messages);
         apply_counts_from_messages (folder, messages);
         return messages;
@@ -652,6 +663,7 @@ public class Mail.MailSession : Camel.Session {
             );
         }
         var messages = yield collect_messages (account, camel_folder, folder, null);
+        resolve_pending_body_rekeys (account, folder, messages);
         apply_counts_from_messages (folder, messages);
         return messages;
     }
@@ -708,6 +720,7 @@ public class Mail.MailSession : Camel.Session {
                 return -1;
             return 0;
         });
+        resolve_pending_body_rekeys (account, folder, messages);
         return messages;
     }
 
@@ -1274,6 +1287,58 @@ public class Mail.MailSession : Camel.Session {
         return null;
     }
 
+    private void resolve_pending_body_rekeys (
+        Account account,
+        Folder folder,
+        GenericArray<Message> live
+    ) {
+        var account_key = account.source_uid ?? account.uid;
+        var claimed = new HashTable<string, uint8> (str_hash, str_equal);
+        for (int i = (int) this.pending_body_rekeys.length - 1; i >= 0; i--) {
+            var pending = this.pending_body_rekeys[i];
+            if (pending.account_key != account_key
+                || pending.destination.full_name != folder.full_name)
+                continue;
+
+            var replacement = matching_live_transfer (live, pending.candidate, claimed);
+            if (replacement == null)
+                continue;
+            rekey_body (account, pending.from, pending.uid, folder, replacement.uid);
+            claimed.set (replacement.uid, 1);
+            this.pending_body_rekeys.remove_index (i);
+        }
+    }
+
+    private static Message? matching_live_transfer (
+        GenericArray<Message> live,
+        Message candidate,
+        HashTable<string, uint8> claimed
+    ) {
+        Message? match = null;
+        for (uint i = 0; i < live.length; i++) {
+            var message = live[i];
+            if (message.is_placeholder || claimed.contains (message.uid))
+                continue;
+
+            var same = candidate.msgid_hash != 0
+                ? message.msgid_hash == candidate.msgid_hash
+                : Conversation.same_outgoing_send (message, candidate)
+                    || (message.subject == candidate.subject
+                        && message.from == candidate.from
+                        && message.to == candidate.to
+                        && message.date == candidate.date);
+            if (!same)
+                continue;
+            /* Without COPYUID there is no safe way to choose between duplicate
+             * destination messages. Keep the source-keyed body until a later
+             * refresh provides an unambiguous match. */
+            if (match != null)
+                return null;
+            match = message;
+        }
+        return match;
+    }
+
     private static bool uses_outlook_flag_semantics (Account account) {
         return account.kind == AccountKind.MICROSOFT || account.kind == AccountKind.EXCHANGE;
     }
@@ -1747,6 +1812,7 @@ public class Mail.MailSession : Camel.Session {
 
         var before_prune = messages.length;
         Conversation.prune_duplicate_sends (messages);
+        resolve_pending_body_rekeys (account, folder, messages);
         if (added == 0 && messages.length == before_prune)
             return 0;
         if (added == 0)
@@ -1793,6 +1859,20 @@ public class Mail.MailSession : Camel.Session {
             return cached;
 
         var camel_folder = yield open_camel_folder (account, folder, null);
+        if (this.pending_body_rekeys.length > 0) {
+            var info = camel_folder.get_message_info (uid);
+            if (info != null && !message_info_is_deleted (info)) {
+                var outgoing = folder.kind == FolderKind.SENT
+                    || folder.kind == FolderKind.DRAFTS
+                    || folder.kind == FolderKind.OUTBOX;
+                var live = new GenericArray<Message> ();
+                live.add (message_from_info (account, uid, info, folder, outgoing, camel_folder));
+                resolve_pending_body_rekeys (account, folder, live);
+                cached = this.body_cache.get (key);
+                if (cached != null)
+                    return cached;
+            }
+        }
         var mime = message_from_local_cache (camel_folder, uid);
         if (mime != null)
             Utils.sync_log ("open body “%s” uid=%s from disk".printf (folder.name, uid));
@@ -2088,6 +2168,19 @@ public class Mail.MailSession : Camel.Session {
         var source_folder = yield open_camel_folder (account, from, cancellable);
         var dest_folder = yield open_camel_folder (account, destination, cancellable);
         yield capture_local_body (account, from, uid, source_folder);
+        Message? body_candidate = null;
+        var info = source_folder.get_message_info (uid);
+        if (info != null) {
+            var outgoing = from.kind == FolderKind.SENT
+                || from.kind == FolderKind.DRAFTS
+                || from.kind == FolderKind.OUTBOX;
+            body_candidate = message_from_info (account, uid, info, from, outgoing, source_folder);
+            body_candidate.local_only = true;
+            var cached = peek_body (account, from, uid);
+            if (body_candidate.msgid_hash == 0 && cached != null
+                && cached.message_id != null && cached.message_id.length > 0)
+                body_candidate.msgid_hash = hash_message_id (cached.message_id, true);
+        }
         var uids = new GenericArray<string> ();
         uids.add (uid);
 #if HAVE_CAMEL_3_58
@@ -2104,17 +2197,33 @@ public class Mail.MailSession : Camel.Session {
              * local \Deleted flag. Push and expunge that source-side flag now. */
             yield source_folder.synchronize (true, Priority.DEFAULT, cancellable);
         } catch (Error e) {
-            if (copy_completed)
-                enqueue_flag_flush (account, from, uids, true);
-            throw e;
+            if (!copy_completed)
+                throw e;
+            /* The destination copy already exists and the source is locally
+             * marked \Deleted. Treat the move as pending so callers cannot
+             * repeat the copy while a later flush retries only EXPUNGE. */
+            warning ("Could not expunge moved message: %s", e.message);
+            enqueue_flag_flush (account, from, uids, true);
         } finally {
             leave_camel (true);
         }
         string? new_uid = null;
         if (transferred != null && transferred.length > 0 && transferred[0] != null && transferred[0].length > 0)
             new_uid = transferred[0];
-        if (new_uid != null)
+        if (new_uid != null) {
             rekey_body (account, from, uid, destination, new_uid);
+        } else if (body_candidate != null && peek_body (account, from, uid) != null) {
+            /* Servers without COPYUID cannot identify the destination body key
+             * yet. Reconcile it once that folder exposes one unique matching
+             * header, retaining the source-keyed body in the meantime. */
+            this.pending_body_rekeys.add (new PendingBodyRekey () {
+                account_key = account.source_uid ?? account.uid,
+                from = from,
+                uid = uid,
+                destination = destination,
+                candidate = body_candidate,
+            });
+        }
         apply_camel_counts (from, source_folder);
         apply_camel_counts (destination, dest_folder);
         return new_uid ?? "";
@@ -2784,9 +2893,8 @@ public class Mail.MailSession : Camel.Session {
                  * \Deleted flags queued so the next local-change flush retries
                  * only the delete side instead of copying messages again. */
                 enqueue_flag_flush (job.account, job.from, job.uids, true);
-                transfer_error = transfer_error == null
-                    ? e.message
-                    : "%s; %s".printf (transfer_error, e.message);
+                if (transfer_error != null)
+                    transfer_error = "%s; %s".printf (transfer_error, e.message);
             }
         }
 
@@ -3059,6 +3167,11 @@ public class Mail.MailSession : Camel.Session {
         });
         for (uint i = 0; i < keys.length; i++)
             this.body_cache.remove (keys[i]);
+        var account_key = account.source_uid ?? account.uid;
+        for (int i = (int) this.pending_body_rekeys.length - 1; i >= 0; i--) {
+            if (this.pending_body_rekeys[i].account_key == account_key)
+                this.pending_body_rekeys.remove_index (i);
+        }
     }
 
     private static uint64 directory_size (string path) {
