@@ -1372,7 +1372,19 @@ public class Mail.MailSession : Camel.Session {
             var replacement = matching_live_transfer (live, pending.candidate, claimed);
             if (replacement == null)
                 continue;
-            rekey_body (account, pending.from, pending.uid, folder, replacement.uid);
+            if (pending.candidate.uid.has_prefix ("local-copy-")) {
+                /* Copies retain their source body. Only promote a body that
+                 * was opened under the destination placeholder. */
+                rekey_body (
+                    account,
+                    folder,
+                    pending.candidate.uid,
+                    folder,
+                    replacement.uid
+                );
+            } else {
+                rekey_body (account, pending.from, pending.uid, folder, replacement.uid);
+            }
             claimed.set (replacement.uid, 1);
             for (int j = (int) live.length - 1; j >= 0; j--) {
                 if (live[j].is_placeholder
@@ -2935,12 +2947,15 @@ public class Mail.MailSession : Camel.Session {
                 var destination_full_name = state.get_string (group, "destination-folder");
                 var outgoing = state.get_boolean (group, "outgoing");
                 var stored_uid = state.get_string (group, "uid");
-                var candidate_uid = stored_uid;
-                if (stored_uid.has_prefix ("local-move-")) {
+                var stored_candidate_uid = state.has_key (group, "candidate-uid")
+                    ? state.get_string (group, "candidate-uid")
+                    : stored_uid;
+                var candidate_uid = stored_candidate_uid;
+                if (stored_candidate_uid.has_prefix ("local-move-")) {
                     candidate_uid = "local-move-pending-%s".printf (
                         group.substring ("body-".length)
                     );
-                } else if (stored_uid.has_prefix ("local-copy-")) {
+                } else if (stored_candidate_uid.has_prefix ("local-copy-")) {
                     candidate_uid = "local-copy-pending-%s".printf (
                         group.substring ("body-".length)
                     );
@@ -3026,6 +3041,7 @@ public class Mail.MailSession : Camel.Session {
             state.set_string (group, "from-name", pending.from.name);
             state.set_uint64 (group, "from-flags", pending.from.flags);
             state.set_string (group, "uid", pending.uid);
+            state.set_string (group, "candidate-uid", pending.candidate.uid);
             state.set_string (group, "destination-folder", pending.destination.full_name);
             state.set_string (group, "destination-name", pending.destination.name);
             state.set_uint64 (group, "destination-flags", pending.destination.flags);
@@ -3402,8 +3418,8 @@ public class Mail.MailSession : Camel.Session {
                          * can persist caches that intentionally omit placeholders. */
                         var pending = new PendingBodyRekey () {
                             account_key = job.account.source_uid ?? job.account.uid,
-                            from = job.destination,
-                            uid = message.uid,
+                            from = job.delete_original ? job.destination : job.from,
+                            uid = job.delete_original ? message.uid : batch[i],
                             destination = job.destination,
                             candidate = message,
                         };
