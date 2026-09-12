@@ -127,6 +127,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private bool tearing_down;
     private HashTable<string, uint8> hidden_uids;
     private PendingTransferUndo? pending_transfer_undo;
+    private uint64 transfer_placeholder_serial;
     private HashTable<string, uint8> collapsed_folders;
     private Gtk.SizeGroup account_header_sizes;
     private Gtk.SizeGroup account_row_sizes;
@@ -501,6 +502,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             this.mail_session.message_sent.connect (on_message_sent);
             this.mail_session.draft_saved.connect (on_draft_saved);
             this.mail_session.draft_removed.connect (on_draft_removed);
+            this.mail_session.transfer_completed.connect (on_transfer_completed);
             this.mail_session.transfer_failed.connect (on_transfer_failed);
             bind_reader_mailbox ();
         }
@@ -1034,12 +1036,21 @@ public class Mail.Window : Adw.ApplicationWindow {
         enqueue_incoming_folder_sync (RANK_SELECTED_HEADERS);
         watch_new_mail_folders.begin ();
         schedule_folder_scout (3);
+        schedule_idle_bulk_align (true);
     }
 
     private void schedule_idle_bulk_align (bool from_startup) {
         stop_idle_bulk_align ();
-        if (from_startup)
-            Utils.sync_log ("idle bulk align: disabled (cache-first model)");
+        if (this.tearing_down || this.selected_account == null)
+            return;
+
+        var delay = from_startup ? IDLE_BULK_FIRST_SECONDS : IDLE_BULK_STEP_SECONDS;
+        this.idle_bulk_source = Timeout.add_seconds (delay, () => {
+            this.idle_bulk_source = 0;
+            try_idle_bulk_step ();
+            schedule_idle_bulk_align (false);
+            return Source.REMOVE;
+        });
     }
 
     private void stop_idle_bulk_align () {
@@ -1439,8 +1450,16 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         if (job.kind == SYNC_KIND_HEADERS) {
-            if (this.mail_session.folder_has_pending_flags (account, folder))
+            if (this.mail_session.folder_has_pending_flags (account, folder)) {
+                /* The job was already removed from sync_jobs. Put it back after
+                 * the write-side queue gets a chance to finish instead of
+                 * silently losing this reconciliation cycle. */
+                Timeout.add (250, run_sync_job.callback);
+                yield;
+                if (!cancellable.is_cancelled () && is_current_account (account))
+                    enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank);
                 return;
+            }
             var current = is_current_folder (folder);
             uint token = 0;
             if (current) {
@@ -2928,15 +2947,18 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
         cached = this.message_cache.get (cache_key);
         if ((cached == null || cached.length == 0)
-            && (folder.total > 0 || folder.unread > 0 || hint_total > 0 || hint_unread > 0)
-            && !folder_is_incoming_watch (folder)
-            && !folder.is_gmail_namespace) {
+            && (folder.total > 0 || folder.unread > 0 || hint_total > 0 || hint_unread > 0)) {
             if (folder.total <= 0 && hint_total > 0)
                 folder.total = hint_total;
             if (folder.unread <= 0 && hint_unread > 0)
                 folder.unread = hint_unread;
-            boost_folder_sync (folder);
         }
+
+        /* Paint the cache first, then always verify the folder the user chose.
+         * Count-only scouting cannot detect equal-count UID replacement or
+         * remote flag changes in a warm non-Inbox cache. */
+        if (is_current_folder (folder))
+            boost_folder_sync (folder);
     }
 
     private void show_bookmarked_messages () {
@@ -3281,15 +3303,31 @@ public class Mail.Window : Adw.ApplicationWindow {
         return folder_is_bulk_storage (folder) || messages.length >= 200;
     }
 
+    private static bool header_list_cache_needs_update (
+        Account account,
+        Folder folder,
+        GenericArray<Message> messages
+    ) {
+        if (header_list_cache_worth_saving (folder, messages))
+            return true;
+
+        /* Once a folder has a disk cache, keep updating it even after deletes
+         * take the list below the normal persistence threshold. Otherwise an
+         * old, larger snapshot can resurrect removed messages on restart. */
+        var account_uid = account.source_uid ?? account.uid;
+        var path = MailSession.header_list_cache_file (account_uid, folder.full_name);
+        return FileUtils.test (path, FileTest.IS_REGULAR);
+    }
+
     private void queue_header_list_cache_save (
         Account account,
         Folder folder,
         GenericArray<Message> messages
     ) {
-        if (!header_list_cache_worth_saving (folder, messages))
-            return;
         var key = message_cache_key (account, folder);
         var existing = this.header_cache_save_sources.get (key);
+        if (!header_list_cache_needs_update (account, folder, messages) && existing == 0)
+            return;
         if (existing != 0)
             Source.remove (existing);
 
@@ -3307,6 +3345,28 @@ public class Mail.Window : Adw.ApplicationWindow {
             return Source.REMOVE;
         });
         this.header_cache_save_sources.set (key, source);
+    }
+
+    private void save_header_list_cache_now (
+        Account account,
+        Folder folder,
+        GenericArray<Message> messages
+    ) {
+        var key = message_cache_key (account, folder);
+        var pending = this.header_cache_save_sources.get (key);
+        if (!header_list_cache_needs_update (account, folder, messages) && pending == 0)
+            return;
+        if (pending != 0) {
+            Source.remove (pending);
+            this.header_cache_save_sources.remove (key);
+        }
+
+        save_header_list_cache (
+            account.source_uid ?? account.uid,
+            folder.full_name,
+            folder.name,
+            messages
+        );
     }
 
     private static GenericArray<Message>? load_header_list_cache (Account account, Folder folder) {
@@ -3938,6 +3998,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         refresh_folder_badge (folder);
         sync_bookmarks_folder ();
         sync_important_markers ();
+        queue_header_list_cache_save (account, folder, cache);
         if (is_current_folder (folder) && this.search_text.length == 0) {
             if (added > 0 || removed.length > 0)
                 display_messages (account, folder, cache);
@@ -5359,6 +5420,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         try {
             yield this.mail_session.delete_message (account, folder, uid, null);
             refresh_folder_badge (folder);
+            var cache = this.message_cache.get (message_cache_key (account, folder));
+            if (cache != null)
+                save_header_list_cache_now (account, folder, cache);
         } catch (Error e) {
             this.hidden_uids.remove (hide_key (account, folder, uid));
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
@@ -5473,7 +5537,12 @@ public class Mail.Window : Adw.ApplicationWindow {
                     try {
                         this.mail_session.delete_uids.end (res);
                         refresh_folder_badge (folder);
+                        var cache = this.message_cache.get (message_cache_key (account, folder));
+                        if (cache != null)
+                            save_header_list_cache_now (account, folder, cache);
                     } catch (Error e) {
+                        for (uint j = 0; j < uids.length; j++)
+                            this.hidden_uids.remove (hide_key (account, folder, uids[j]));
                         this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                             timeout = 4,
                         });
@@ -5827,9 +5896,13 @@ public class Mail.Window : Adw.ApplicationWindow {
             from.total--;
         if (unseen && from.unread > 0)
             from.unread--;
-        Conversation.apply_folder (message, destination, null);
+        /* UIDs are scoped to a folder. Keeping the source UID in the
+         * destination can collide with an unrelated destination message. */
+        this.transfer_placeholder_serial++;
+        var placeholder_uid = "local-move-%llu".printf (this.transfer_placeholder_serial);
+        Conversation.apply_folder (message, destination, placeholder_uid);
         message.local_only = true;
-        this.mail_session.rekey_body (account, from, old_uid, destination, old_uid);
+        this.mail_session.rekey_body (account, from, old_uid, destination, placeholder_uid);
         add_to_folder_cache (account, destination, message);
         destination.total++;
         if (unseen)
@@ -5931,13 +6004,66 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
-    private void on_transfer_failed (Account account, Folder from, GenericArray<string> uids, string error) {
+    private void on_transfer_completed (Account account, Folder from, Folder destination) {
+        var source_cache = this.message_cache.get (message_cache_key (account, from));
+        if (source_cache != null)
+            save_header_list_cache_now (account, from, source_cache);
+        var destination_cache = this.message_cache.get (message_cache_key (account, destination));
+        if (destination_cache != null)
+            save_header_list_cache_now (account, destination, destination_cache);
+
+        if (!is_current_account (account))
+            return;
+
+        /* Confirm both UID namespaces after the backend has assigned the real
+         * destination UID and removed the source message. */
+        enqueue_sync_job (SYNC_KIND_HEADERS, from, RANK_SELECTED_HEADERS);
+        if (from.full_name != destination.full_name && destination_cache != null)
+            enqueue_sync_job (SYNC_KIND_HEADERS, destination, RANK_SELECTED_HEADERS);
+        pump_sync.begin ();
+    }
+
+    private void on_transfer_failed (
+        Account account,
+        Folder from,
+        Folder destination,
+        GenericArray<string> uids,
+        GenericArray<Message>? messages,
+        string error
+    ) {
         for (uint i = 0; i < uids.length; i++)
             this.hidden_uids.remove (hide_key (account, from, uids[i]));
+
+        /* Drop the optimistic destination placeholders. The source cache is
+         * rebuilt from Camel below, where the originals still exist. */
+        var destination_cache = this.message_cache.get (message_cache_key (account, destination));
+        if (messages != null) {
+            for (uint i = 0; i < messages.length; i++) {
+                if (i < uids.length) {
+                    this.mail_session.rekey_body (
+                        account,
+                        destination,
+                        messages[i].uid,
+                        from,
+                        uids[i]
+                    );
+                }
+                remove_from_folder_cache (account, destination, messages[i].uid);
+                remove_from_search_results (messages[i].uid, destination.full_name);
+            }
+        }
+        restore_folder_counts_from_cache (account, destination);
+        refresh_folder_badge (destination);
         this.toast_overlay.add_toast (new Adw.Toast (error) {
             timeout = 4,
         });
-        refresh_open_folder.begin (true, false);
+
+        if (!is_current_account (account))
+            return;
+        enqueue_sync_job (SYNC_KIND_HEADERS, from, RANK_SELECTED_HEADERS);
+        if (from.full_name != destination.full_name && destination_cache != null)
+            enqueue_sync_job (SYNC_KIND_HEADERS, destination, RANK_SELECTED_HEADERS);
+        pump_sync.begin ();
     }
 
     private Folder? find_archive_folder () {
@@ -6716,7 +6842,13 @@ public class Mail.Window : Adw.ApplicationWindow {
         try {
             yield this.mail_session.empty_folder (account, folder);
             refresh_folder_badge (folder);
+            var empty = this.message_cache.get (key) ?? new GenericArray<Message> ();
+            save_header_list_cache_now (account, folder, empty);
         } catch (Error e) {
+            if (cache != null) {
+                for (uint i = 0; i < cache.length; i++)
+                    this.hidden_uids.remove (hide_key (account, folder, cache[i].uid));
+            }
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 5,
             });
@@ -7372,7 +7504,7 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         /* Push local flag/move/copy changes before asking the server for new mail. */
         commit_pending_transfer_undo ();
-        this.mail_session.flush_pending_local_changes ();
+        this.mail_session.flush_pending_local_changes.begin ();
 
         var full_due = force_tree || this.last_full_align == 0
             || (Utils.sync_tick () - this.last_full_align) >= (int64) FULL_ALIGN_SECONDS * 1000 * 1000;
@@ -7566,6 +7698,12 @@ public class Mail.Window : Adw.ApplicationWindow {
         return false;
     }
 
+    public async void prepare_to_close () {
+        commit_pending_transfer_undo ();
+        if (this.mail_session != null)
+            yield this.mail_session.flush_pending_local_changes ();
+    }
+
     private void persist_window_state () {
         this.settings.set_int ("window-width", get_width ().clamp (WINDOW_MIN_WIDTH, 4000));
         this.settings.set_int ("window-height", get_height ().clamp (WINDOW_MIN_HEIGHT, 4000));
@@ -7581,7 +7719,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.tearing_down = true;
 
         commit_pending_transfer_undo ();
-        this.mail_session?.flush_pending_local_changes ();
+        if (this.mail_session != null)
+            this.mail_session.flush_pending_local_changes.begin ();
 
         if (this.sync_source != 0) {
             Source.remove (this.sync_source);
@@ -7612,6 +7751,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             this.mail_session.message_sent.disconnect (on_message_sent);
             this.mail_session.draft_saved.disconnect (on_draft_saved);
             this.mail_session.draft_removed.disconnect (on_draft_removed);
+            this.mail_session.transfer_completed.disconnect (on_transfer_completed);
             this.mail_session.transfer_failed.disconnect (on_transfer_failed);
         }
     }
