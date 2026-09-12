@@ -6201,14 +6201,27 @@ public class Mail.Window : Adw.ApplicationWindow {
         restore_folder_counts_from_cache (account, from);
         restore_folder_counts_from_cache (account, destination);
         var source_cache = this.message_cache.get (message_cache_key (account, from));
-        if (failed_copy && source_cache != null) {
+        if (failed_copy) {
             /* These source UIDs were marked Important only for copies that
              * just failed. Clear the optimistic state before persisting, even
              * if the user switched accounts while the request was running. */
-            for (uint i = 0; i < uids.length; i++) {
-                for (uint j = 0; j < source_cache.length; j++) {
-                    if (source_cache[j].uid == uids[i])
-                        source_cache[j].important = false;
+            var failed_uids = new HashTable<string, uint8> (str_hash, str_equal);
+            for (uint i = 0; i < uids.length; i++)
+                failed_uids.set (uids[i], 1);
+            if (source_cache != null) {
+                for (uint i = 0; i < source_cache.length; i++) {
+                    if (failed_uids.contains (source_cache[i].uid))
+                        source_cache[i].important = false;
+                }
+            }
+            /* Global search can return messages without hydrating their source
+             * folder cache. Reset those live objects explicitly as well. */
+            if (current && this.search_results != null) {
+                for (uint i = 0; i < this.search_results.length; i++) {
+                    var result = this.search_results[i];
+                    if ((result.folder_full_name ?? "") == from.full_name
+                        && failed_uids.contains (result.uid))
+                        result.important = false;
                 }
             }
             if (current)

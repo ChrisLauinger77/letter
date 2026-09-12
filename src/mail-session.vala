@@ -2454,6 +2454,10 @@ public class Mail.MailSession : Camel.Session {
                 || from.kind == FolderKind.DRAFTS
                 || from.kind == FolderKind.OUTBOX;
             body_candidate = message_from_info (account, uid, info, from, outgoing, source_folder);
+            /* The source UID cannot identify a row in the destination after a
+             * no-COPYUID move. Give recovery a distinct destination identity
+             * while retaining the real source UID in PendingBodyRekey. */
+            body_candidate.uid = "local-move-%s".printf (Uuid.string_random ());
             body_candidate.local_only = true;
             var cached = peek_body (account, from, uid);
             if (body_candidate.msgid_hash == 0 && cached != null
