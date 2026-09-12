@@ -598,8 +598,10 @@ public class Mail.MailSession : Camel.Session {
         if (watch)
             watch_camel_folder (account, folder, camel_folder);
 
+        var refreshed = false;
         if (refresh && !folder_has_pending_flags (account, folder)) {
             yield refresh_folder_info (camel_folder, high);
+            refreshed = true;
         }
 
         if (cancellable != null && cancellable.is_cancelled ())
@@ -652,7 +654,10 @@ public class Mail.MailSession : Camel.Session {
             ));
         }
 
-        resolve_pending_body_rekeys (account, folder, messages);
+        /* A local Camel summary may be stale or incomplete. Only bind an
+         * unknown no-COPYUID destination after a successful server refresh. */
+        if (refreshed)
+            resolve_pending_body_rekeys (account, folder, messages);
         messages = retain_local_only (account, folder, messages, previous);
         retain_pending_transfer_placeholders (account, folder, messages);
         Conversation.prune_duplicate_sends (messages);
@@ -670,14 +675,17 @@ public class Mail.MailSession : Camel.Session {
     public async GenericArray<Message> sync_headers (Account account, Folder folder) throws Error {
         var camel_folder = yield open_camel_folder (account, folder, null);
         watch_camel_folder (account, folder, camel_folder);
+        var refreshed = false;
         if (!folder_has_pending_flags (account, folder)) {
             yield refresh_folder_info (
                 camel_folder,
                 folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS
             );
+            refreshed = true;
         }
         var messages = yield collect_messages (account, camel_folder, folder, null);
-        resolve_pending_body_rekeys (account, folder, messages);
+        if (refreshed)
+            resolve_pending_body_rekeys (account, folder, messages);
         retain_pending_transfer_placeholders (account, folder, messages);
         apply_counts_from_messages (folder, messages);
         return messages;
@@ -745,8 +753,9 @@ public class Mail.MailSession : Camel.Session {
         Cancellable? cancellable = null
     ) throws Error {
         var camel_folder = yield open_camel_folder (account, folder, cancellable);
-        if (!folder_has_pending_flags (account, folder))
-            yield refresh_folder_info (camel_folder, true);
+        if (folder_has_pending_flags (account, folder))
+            return null;
+        yield refresh_folder_info (camel_folder, true);
         var messages = yield collect_messages (account, camel_folder, folder, cancellable);
         return matching_message_uid (messages, candidate);
     }
@@ -1296,7 +1305,7 @@ public class Mail.MailSession : Camel.Session {
         return live;
     }
 
-    private void retain_pending_transfer_placeholders (
+    public void retain_pending_transfer_placeholders (
         Account account,
         Folder folder,
         GenericArray<Message> live
@@ -1370,10 +1379,9 @@ public class Mail.MailSession : Camel.Session {
                     && live[j].uid == pending.candidate.uid)
                     live.remove_index (j);
             }
+            pending.resolved_uid = replacement.uid;
             if (pending.body_path == null)
                 this.pending_body_rekeys.remove_index (i);
-            else
-                pending.resolved_uid = replacement.uid;
             changed = true;
         }
         if (changed)
@@ -1392,7 +1400,7 @@ public class Mail.MailSession : Camel.Session {
         return false;
     }
 
-    private PendingBodyRekey? resolved_body_rekey (
+    private PendingBodyRekey? pending_body_rekey (
         Account account,
         Folder folder,
         string uid
@@ -1402,7 +1410,7 @@ public class Mail.MailSession : Camel.Session {
             var pending = this.pending_body_rekeys[i];
             if (pending.account_key == account_key
                 && pending.destination.full_name == folder.full_name
-                && pending.resolved_uid == uid)
+                && (pending.resolved_uid == uid || pending.candidate.uid == uid))
                 return pending;
         }
         return null;
@@ -2007,7 +2015,6 @@ public class Mail.MailSession : Camel.Session {
 
         var before_prune = messages.length;
         Conversation.prune_duplicate_sends (messages);
-        resolve_pending_body_rekeys (account, folder, messages);
         if (added == 0 && messages.length == before_prune)
             return 0;
         if (added == 0)
@@ -2048,10 +2055,14 @@ public class Mail.MailSession : Camel.Session {
     }
 
     public async MessageContent load_message (Account account, Folder folder, string uid, Cancellable? cancellable = null) throws Error {
-        var key = body_key (account, folder, uid);
-        var cached = this.body_cache.get (key);
-        var pending = resolved_body_rekey (account, folder, uid);
-        if (cached != null && pending == null)
+        var requested_key = body_key (account, folder, uid);
+        var pending = pending_body_rekey (account, folder, uid);
+        var load_uid = pending != null && pending.resolved_uid != null
+            ? pending.resolved_uid
+            : uid;
+        var key = body_key (account, folder, load_uid);
+        var cached = this.body_cache.get (key) ?? this.body_cache.get (requested_key);
+        if (cached != null && (pending == null || pending.resolved_uid == null))
             return cached;
 
         var has_unresolved_rekey = folder_has_pending_body_rekeys (account, folder);
@@ -2060,15 +2071,30 @@ public class Mail.MailSession : Camel.Session {
         if (has_unresolved_rekey) {
             /* A singleton candidate cannot establish uniqueness: the folder
              * may already contain another message with the same Message-ID or
-             * fallback fingerprint. Resolve only against the complete summary. */
-            var live = yield collect_messages (account, camel_folder, folder, cancellable);
-            resolve_pending_body_rekeys (account, folder, live);
-            cached = this.body_cache.get (key);
-            pending = resolved_body_rekey (account, folder, uid);
-            if (pending != null)
-                defer_online = true;
+             * fallback fingerprint. Resolve only after a successful online
+             * refresh; an offline/local summary is not authoritative. */
+            try {
+                var requested_pending = pending;
+                camel_folder = yield open_camel_folder (account, folder, cancellable, true);
+                yield refresh_folder_info (camel_folder, true);
+                var live = yield collect_messages (account, camel_folder, folder, cancellable);
+                resolve_pending_body_rekeys (account, folder, live);
+                pending = pending_body_rekey (account, folder, uid);
+                if (pending == null && requested_pending != null
+                    && requested_pending.resolved_uid != null)
+                    pending = requested_pending;
+            } catch (Error e) {
+                if (cancellable != null && cancellable.is_cancelled ())
+                    throw e;
+                debug ("Could not refresh pending moved message %s: %s", uid, e.message);
+            }
+            load_uid = pending != null && pending.resolved_uid != null
+                ? pending.resolved_uid
+                : uid;
+            key = body_key (account, folder, load_uid);
+            cached = this.body_cache.get (key) ?? this.body_cache.get (requested_key);
         }
-        var mime = message_from_local_cache (camel_folder, uid);
+        var mime = message_from_local_cache (camel_folder, load_uid);
         var destination_cached = mime != null;
         if (destination_cached && pending != null) {
             finish_body_rekey (pending);
@@ -2092,17 +2118,22 @@ public class Mail.MailSession : Camel.Session {
                 }
             }
             if (mime != null)
-                Utils.sync_log ("open body “%s” uid=%s from moved disk cache".printf (folder.name, uid));
+                Utils.sync_log ("open body “%s” uid=%s from moved disk cache".printf (folder.name, load_uid));
         }
         if (mime == null) {
+            if (pending != null && pending.resolved_uid == null) {
+                throw new IOError.NOT_FOUND (
+                    _("This message is still syncing with the server. Try again in a moment.")
+                );
+            }
             if (defer_online)
                 camel_folder = yield open_camel_folder (account, folder, cancellable, true);
-            Utils.sync_log ("open body “%s” uid=%s from server".printf (folder.name, uid));
+            Utils.sync_log ("open body “%s” uid=%s from server".printf (folder.name, load_uid));
             try {
-                mime = yield fetch_camel_message (camel_folder, uid, Priority.DEFAULT);
-                destination_cached = message_from_local_cache (camel_folder, uid) != null;
+                mime = yield fetch_camel_message (camel_folder, load_uid, Priority.DEFAULT);
+                destination_cached = message_from_local_cache (camel_folder, load_uid) != null;
             } catch (Error e) {
-                mime = message_from_local_cache (camel_folder, uid);
+                mime = message_from_local_cache (camel_folder, load_uid);
                 destination_cached = mime != null;
                 if (mime == null) {
                     if (is_missing_on_server (e)) {
@@ -2120,7 +2151,7 @@ public class Mail.MailSession : Camel.Session {
             );
         }
 
-        var fetched = MessageContent.from_mime (uid, mime);
+        var fetched = MessageContent.from_mime (load_uid, mime);
         this.body_cache.set (key, fetched);
         if (pending != null && destination_cached)
             finish_body_rekey (pending);

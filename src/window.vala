@@ -3366,28 +3366,33 @@ public class Mail.Window : Adw.ApplicationWindow {
         );
     }
 
-    private static GenericArray<Message>? load_header_list_cache (Account account, Folder folder) {
+    private GenericArray<Message>? load_header_list_cache (Account account, Folder folder) {
+        var messages = new GenericArray<Message> ();
         var account_uid = account.source_uid ?? account.uid;
         var path = MailSession.header_list_cache_file (account_uid, folder.full_name);
-        if (!FileUtils.test (path, FileTest.IS_REGULAR))
-            return null;
+        if (!FileUtils.test (path, FileTest.IS_REGULAR)) {
+            this.mail_session?.retain_pending_transfer_placeholders (account, folder, messages);
+            return messages.length > 0 ? messages : null;
+        }
 
         string contents;
         try {
             FileUtils.get_contents (path, out contents);
         } catch (Error e) {
             debug ("Could not read header list cache: %s", e.message);
-            return null;
+            this.mail_session?.retain_pending_transfer_placeholders (account, folder, messages);
+            return messages.length > 0 ? messages : null;
         }
 
         var lines = contents.split ("\n");
-        if (lines.length < 2 || lines[0] != "letter-headers-v1")
-            return null;
+        if (lines.length < 2 || lines[0] != "letter-headers-v1") {
+            this.mail_session?.retain_pending_transfer_placeholders (account, folder, messages);
+            return messages.length > 0 ? messages : null;
+        }
 
         var outgoing = folder.kind == FolderKind.SENT
             || folder.kind == FolderKind.DRAFTS
             || folder.kind == FolderKind.OUTBOX;
-        var messages = new GenericArray<Message> ();
         for (int i = 1; i < lines.length; i++) {
             var line = lines[i];
             if (line.length == 0)
@@ -3448,9 +3453,8 @@ public class Mail.Window : Adw.ApplicationWindow {
             });
         }
 
-        if (messages.length == 0)
-            return null;
-        return messages;
+        this.mail_session?.retain_pending_transfer_placeholders (account, folder, messages);
+        return messages.length > 0 ? messages : null;
     }
 
     private static void save_header_list_cache (
@@ -5160,9 +5164,9 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
             source.important = true;
             restore_folder_counts_from_cache (account, destination);
-            refresh_folder_badge (destination);
 
             if (is_current_account (account)) {
+                refresh_folder_badge (destination);
                 sync_important_markers ();
                 source.important = true;
                 this.open_conversation?.refresh ();
