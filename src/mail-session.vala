@@ -1239,6 +1239,7 @@ public class Mail.MailSession : Camel.Session {
             live[i].local_only = false;
         }
 
+        var claimed = new HashTable<string, uint8> (str_hash, str_equal);
         var added = false;
         for (uint i = 0; i < previous.length; i++) {
             var message = previous[i];
@@ -1246,13 +1247,10 @@ public class Mail.MailSession : Camel.Session {
                 continue;
             if (have_uid.contains (message.uid))
                 continue;
-            Message? replacement = null;
-            if (message.msgid_hash != 0)
-                replacement = live_with_msgid (live, message.msgid_hash);
-            if (replacement == null)
-                replacement = matching_live_outgoing_send (live, message);
+            var replacement = matching_live_transfer (live, message, claimed);
             if (replacement != null) {
                 rekey_body (account, folder, message.uid, folder, replacement.uid);
+                claimed.set (replacement.uid, 1);
                 continue;
             }
             live.add (message);
@@ -1269,22 +1267,6 @@ public class Mail.MailSession : Camel.Session {
             return 0;
         });
         return live;
-    }
-
-    private static Message? matching_live_outgoing_send (GenericArray<Message> live, Message candidate) {
-        for (uint i = 0; i < live.length; i++) {
-            if (Conversation.same_outgoing_send (live[i], candidate))
-                return live[i];
-        }
-        return null;
-    }
-
-    private static Message? live_with_msgid (GenericArray<Message> live, uint64 hash) {
-        for (uint i = 0; i < live.length; i++) {
-            if (live[i].msgid_hash == hash)
-                return live[i];
-        }
-        return null;
     }
 
     private void resolve_pending_body_rekeys (
@@ -1341,8 +1323,8 @@ public class Mail.MailSession : Camel.Session {
             if (!same)
                 continue;
             /* Without COPYUID there is no safe way to choose between duplicate
-             * destination messages. Keep the source-keyed body until a later
-             * refresh provides an unambiguous match. */
+             * destination messages. Keep the body under its local/source key
+             * until a later refresh provides an unambiguous match. */
             if (match != null)
                 return null;
             match = message;
@@ -2433,14 +2415,19 @@ public class Mail.MailSession : Camel.Session {
         }
 
         var uids = new GenericArray<string> ();
+        var newly_deleted = new GenericArray<string> ();
         camel_folder.freeze ();
         try {
             for (uint i = 0; i < raw.length; i++) {
-                camel_folder.set_message_flags (
-                    raw[i],
-                    Camel.MessageFlags.DELETED,
-                    Camel.MessageFlags.DELETED
-                );
+                var flags = camel_folder.get_message_flags (raw[i]);
+                if ((flags & Camel.MessageFlags.DELETED) == 0) {
+                    camel_folder.set_message_flags (
+                        raw[i],
+                        Camel.MessageFlags.DELETED,
+                        Camel.MessageFlags.DELETED
+                    );
+                    newly_deleted.add (raw[i]);
+                }
                 uids.add (raw[i]);
             }
         } finally {
@@ -2456,8 +2443,8 @@ public class Mail.MailSession : Camel.Session {
         } catch (Error e) {
             camel_folder.freeze ();
             try {
-                for (uint i = 0; i < uids.length; i++)
-                    camel_folder.set_message_flags (uids[i], Camel.MessageFlags.DELETED, 0);
+                for (uint i = 0; i < newly_deleted.length; i++)
+                    camel_folder.set_message_flags (newly_deleted[i], Camel.MessageFlags.DELETED, 0);
             } finally {
                 camel_folder.thaw ();
             }
