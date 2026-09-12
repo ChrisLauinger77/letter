@@ -5201,14 +5201,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         var cached = this.message_cache.get (message_cache_key (account, folder));
         if (cached == null)
             return null;
-        for (uint i = 0; i < cached.length; i++) {
-            var item = cached[i];
-            if (message.msgid_hash != 0 && item.msgid_hash == message.msgid_hash)
-                return item.uid;
-            if (item.uid == message.uid)
-                return item.uid;
-        }
-        return null;
+        return MailSession.matching_message_uid (cached, message);
     }
 
     private void sync_important_markers () {

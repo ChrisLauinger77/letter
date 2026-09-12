@@ -738,6 +738,19 @@ public class Mail.MailSession : Camel.Session {
         return messages;
     }
 
+    public async string? find_matching_uid (
+        Account account,
+        Folder folder,
+        Message candidate,
+        Cancellable? cancellable = null
+    ) throws Error {
+        var camel_folder = yield open_camel_folder (account, folder, cancellable);
+        if (!folder_has_pending_flags (account, folder))
+            yield refresh_folder_info (camel_folder, true);
+        var messages = yield collect_messages (account, camel_folder, folder, cancellable);
+        return matching_message_uid (messages, candidate);
+    }
+
     public static string header_search_expression (SearchQuery query, bool include_body = false) {
         if (query.is_empty)
             return "(match-all false)";
@@ -1299,7 +1312,8 @@ public class Mail.MailSession : Camel.Session {
             if (pending.account_key != account_key
                 || pending.destination.full_name != folder.full_name
                 || pending.resolved_uid != null
-                || !pending.candidate.uid.has_prefix ("local-move-")
+                || !(pending.candidate.uid.has_prefix ("local-move-")
+                    || pending.candidate.uid.has_prefix ("local-copy-"))
                 || have_uid.contains (pending.candidate.uid))
                 continue;
 
@@ -1509,6 +1523,15 @@ public class Mail.MailSession : Camel.Session {
             match = message;
         }
         return match;
+    }
+
+    public static string? matching_message_uid (
+        GenericArray<Message> messages,
+        Message candidate
+    ) {
+        var claimed = new HashTable<string, uint8> (str_hash, str_equal);
+        var match = matching_live_transfer (messages, candidate, claimed);
+        return match != null ? match.uid : null;
     }
 
     private static bool uses_outlook_flag_semantics (Account account) {
@@ -2881,9 +2904,16 @@ public class Mail.MailSession : Camel.Session {
                 var destination_full_name = state.get_string (group, "destination-folder");
                 var outgoing = state.get_boolean (group, "outgoing");
                 var stored_uid = state.get_string (group, "uid");
-                var candidate_uid = stored_uid.has_prefix ("local-move-")
-                    ? "local-move-pending-%s".printf (group.substring ("body-".length))
-                    : stored_uid;
+                var candidate_uid = stored_uid;
+                if (stored_uid.has_prefix ("local-move-")) {
+                    candidate_uid = "local-move-pending-%s".printf (
+                        group.substring ("body-".length)
+                    );
+                } else if (stored_uid.has_prefix ("local-copy-")) {
+                    candidate_uid = "local-copy-pending-%s".printf (
+                        group.substring ("body-".length)
+                    );
+                }
                 string? resolved_uid = null;
                 if (state.has_key (group, "resolved-uid")) {
                     var stored = state.get_string (group, "resolved-uid");
@@ -3334,11 +3364,11 @@ public class Mail.MailSession : Camel.Session {
                      * can match the real destination message safely. */
                     if (message != null && new_uid != null)
                         message.local_only = false;
-                    if (message != null && job.delete_original && new_uid == null) {
-                        /* The server completed the move but supplied no
-                         * destination UID. Journal both the optimistic header
-                         * and any offline body before completion signals can
-                         * persist caches that intentionally omit placeholders. */
+                    if (message != null && new_uid == null) {
+                        /* The server completed the move or copy but supplied
+                         * no destination UID. Journal the optimistic header
+                         * and any offline move body before completion signals
+                         * can persist caches that intentionally omit placeholders. */
                         var pending = new PendingBodyRekey () {
                             account_key = job.account.source_uid ?? job.account.uid,
                             from = job.destination,
