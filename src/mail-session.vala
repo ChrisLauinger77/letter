@@ -37,6 +37,7 @@ public class Mail.MailSession : Camel.Session {
     public signal void message_sent (Account account, Message? sent);
     public signal void draft_saved (Account account, Message? draft);
     public signal void draft_removed (Account account, Folder folder, string uid);
+    public signal void folder_flags_flushed (Account account, Folder folder);
     public signal void transfer_completed (Account account, Folder from, Folder destination);
     public signal void transfer_failed (
         Account account,
@@ -628,7 +629,7 @@ public class Mail.MailSession : Camel.Session {
         }
 
         apply_counts_from_messages (folder, messages);
-        messages = retain_local_only (messages, previous);
+        messages = retain_local_only (account, folder, messages, previous);
         Conversation.prune_duplicate_sends (messages);
         apply_counts_from_messages (folder, messages);
         return messages;
@@ -1210,7 +1211,9 @@ public class Mail.MailSession : Camel.Session {
         return result;
     }
 
-    private static GenericArray<Message> retain_local_only (
+    private GenericArray<Message> retain_local_only (
+        Account account,
+        Folder folder,
         GenericArray<Message> live,
         GenericArray<Message>? previous
     ) {
@@ -1230,10 +1233,15 @@ public class Mail.MailSession : Camel.Session {
                 continue;
             if (have_uid.contains (message.uid))
                 continue;
-            if (message.msgid_hash != 0 && live_has_msgid (live, message.msgid_hash))
+            Message? replacement = null;
+            if (message.msgid_hash != 0)
+                replacement = live_with_msgid (live, message.msgid_hash);
+            if (replacement == null)
+                replacement = matching_live_outgoing_send (live, message);
+            if (replacement != null) {
+                rekey_body (account, folder, message.uid, folder, replacement.uid);
                 continue;
-            if (live_has_outgoing_send (live, message))
-                continue;
+            }
             live.add (message);
             added = true;
         }
@@ -1250,20 +1258,20 @@ public class Mail.MailSession : Camel.Session {
         return live;
     }
 
-    private static bool live_has_outgoing_send (GenericArray<Message> live, Message candidate) {
+    private static Message? matching_live_outgoing_send (GenericArray<Message> live, Message candidate) {
         for (uint i = 0; i < live.length; i++) {
             if (Conversation.same_outgoing_send (live[i], candidate))
-                return true;
+                return live[i];
         }
-        return false;
+        return null;
     }
 
-    private static bool live_has_msgid (GenericArray<Message> live, uint64 hash) {
+    private static Message? live_with_msgid (GenericArray<Message> live, uint64 hash) {
         for (uint i = 0; i < live.length; i++) {
             if (live[i].msgid_hash == hash)
-                return true;
+                return live[i];
         }
-        return false;
+        return null;
     }
 
     private static bool uses_outlook_flag_semantics (Account account) {
@@ -2609,6 +2617,8 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
         this.flag_flush_latest.remove (key);
+        if (!failed)
+            this.folder_flags_flushed (job.account, job.folder);
     }
 
     private void bump_transfer_pending (Account account, Folder folder, int delta) {

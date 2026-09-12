@@ -502,6 +502,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             this.mail_session.message_sent.connect (on_message_sent);
             this.mail_session.draft_saved.connect (on_draft_saved);
             this.mail_session.draft_removed.connect (on_draft_removed);
+            this.mail_session.folder_flags_flushed.connect (on_folder_flags_flushed);
             this.mail_session.transfer_completed.connect (on_transfer_completed);
             this.mail_session.transfer_failed.connect (on_transfer_failed);
             bind_reader_mailbox ();
@@ -1451,13 +1452,9 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         if (job.kind == SYNC_KIND_HEADERS) {
             if (this.mail_session.folder_has_pending_flags (account, folder)) {
-                /* The job was already removed from sync_jobs. Put it back after
-                 * the write-side queue gets a chance to finish instead of
-                 * silently losing this reconciliation cycle. */
-                Timeout.add (250, run_sync_job.callback);
-                yield;
-                if (!cancellable.is_cancelled () && is_current_account (account))
-                    enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank);
+                /* Transfer/flag completion signals enqueue reconciliation.
+                 * Do not spin the sync pump while an EXPUNGE retry is waiting. */
+                Utils.sync_log ("headers “%s” deferred for pending local writes".printf (folder.name));
                 return;
             }
             var current = is_current_folder (folder);
@@ -6055,6 +6052,17 @@ public class Mail.Window : Adw.ApplicationWindow {
         pump_sync.begin ();
     }
 
+    private void on_folder_flags_flushed (Account account, Folder folder) {
+        if (!is_current_account (account))
+            return;
+        enqueue_sync_job (
+            SYNC_KIND_HEADERS,
+            folder,
+            is_current_folder (folder) ? RANK_SELECTED_HEADERS : background_header_rank (folder)
+        );
+        pump_sync.begin ();
+    }
+
     private void on_transfer_failed (
         Account account,
         Folder from,
@@ -7796,6 +7804,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             this.mail_session.message_sent.disconnect (on_message_sent);
             this.mail_session.draft_saved.disconnect (on_draft_saved);
             this.mail_session.draft_removed.disconnect (on_draft_removed);
+            this.mail_session.folder_flags_flushed.disconnect (on_folder_flags_flushed);
             this.mail_session.transfer_completed.disconnect (on_transfer_completed);
             this.mail_session.transfer_failed.disconnect (on_transfer_failed);
         }
