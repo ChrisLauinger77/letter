@@ -5819,16 +5819,17 @@ public class Mail.Window : Adw.ApplicationWindow {
         var from = item.from;
         var uid = item.uid;
         var unseen = !message.seen;
+        var placeholder_uid = message.uid;
 
         this.hidden_uids.remove (hide_key (account, from, uid));
+        this.mail_session.rekey_body (account, destination, placeholder_uid, from, uid);
         Conversation.apply_folder (message, from, uid);
         message.folder_name = item.folder_name;
         message.outgoing = item.outgoing;
         message.local_only = item.local_only;
         if (item.folder_full_name != null)
             message.folder_full_name = item.folder_full_name;
-        this.mail_session.rekey_body (account, destination, message.uid, from, uid);
-        remove_from_folder_cache (account, destination, message.uid);
+        remove_from_folder_cache (account, destination, placeholder_uid);
         add_to_folder_cache (account, from, message);
         from.total++;
         if (unseen)

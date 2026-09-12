@@ -15,6 +15,7 @@ public class Mail.MailSession : Camel.Session {
     private HashTable<string, MessageContent> body_cache;
     private GenericArray<FlagFlushJob> flag_flush_queue;
     private HashTable<string, FlagFlushJob> flag_flush_latest;
+    private HashTable<string, FlagFlushJob> flag_flush_retries;
     private bool flag_flush_running;
     private GenericArray<TransferFlushJob> transfer_flush_queue;
     private HashTable<string, uint> transfer_pending;
@@ -79,6 +80,7 @@ public class Mail.MailSession : Camel.Session {
         this.body_cache = new HashTable<string, MessageContent> (str_hash, str_equal);
         this.flag_flush_queue = new GenericArray<FlagFlushJob> ();
         this.flag_flush_latest = new HashTable<string, FlagFlushJob> (str_hash, str_equal);
+        this.flag_flush_retries = new HashTable<string, FlagFlushJob> (str_hash, str_equal);
         this.transfer_flush_queue = new GenericArray<TransferFlushJob> ();
         this.transfer_pending = new HashTable<string, uint> (str_hash, str_equal);
         this.folder_watches = new HashTable<string, FolderWatch> (str_hash, str_equal);
@@ -354,6 +356,7 @@ public class Mail.MailSession : Camel.Session {
         public Account account;
         public Folder folder;
         public GenericArray<string> uids;
+        public bool expunge;
     }
 
     private class TransferFlushJob {
@@ -2084,22 +2087,29 @@ public class Mail.MailSession : Camel.Session {
 #else
         GenericArray<string>? transferred = null;
 #endif
+        var copy_completed = false;
         yield enter_camel (true);
         try {
             yield source_folder.transfer_messages_to (uids, dest_folder, true, Priority.DEFAULT, cancellable, out transferred);
+            copy_completed = true;
             /* IMAP servers without UID MOVE implement this as COPY plus a
              * local \Deleted flag. Push and expunge that source-side flag now. */
             yield source_folder.synchronize (true, Priority.DEFAULT, cancellable);
+        } catch (Error e) {
+            if (copy_completed)
+                enqueue_flag_flush (account, from, uids, true);
+            throw e;
         } finally {
             leave_camel (true);
         }
-        var new_uid = uid;
+        string? new_uid = null;
         if (transferred != null && transferred.length > 0 && transferred[0] != null && transferred[0].length > 0)
             new_uid = transferred[0];
-        rekey_body (account, from, uid, destination, new_uid);
+        if (new_uid != null)
+            rekey_body (account, from, uid, destination, new_uid);
         apply_camel_counts (from, source_folder);
         apply_camel_counts (destination, dest_folder);
-        return new_uid;
+        return new_uid ?? "";
     }
 
     public async string copy_message (Account account, Folder from, string uid, Folder destination, Cancellable? cancellable = null) throws Error {
@@ -2118,12 +2128,12 @@ public class Mail.MailSession : Camel.Session {
         } finally {
             leave_camel (true);
         }
-        var new_uid = uid;
+        string? new_uid = null;
         if (transferred != null && transferred.length > 0 && transferred[0] != null && transferred[0].length > 0)
             new_uid = transferred[0];
         apply_camel_counts (from, source_folder);
         apply_camel_counts (destination, dest_folder);
-        return new_uid;
+        return new_uid ?? "";
     }
 
     public void enqueue_move_messages (
@@ -2191,6 +2201,7 @@ public class Mail.MailSession : Camel.Session {
 
     /* Push deferred flag/move/copy jobs (call from sync-interval / manual refresh). */
     public async void flush_pending_local_changes () {
+        stage_flag_flush_retries ();
         if (this.flag_flush_queue.length > 0)
             Utils.sync_log ("flushing deferred flags (%u queue)".printf (this.flag_flush_queue.length));
         if (this.transfer_flush_queue.length > 0)
@@ -2470,17 +2481,43 @@ public class Mail.MailSession : Camel.Session {
         return "%s\n%s".printf (account.source_uid ?? account.uid, folder.full_name);
     }
 
-    private void enqueue_flag_flush (Account account, Folder folder, GenericArray<string> uids) {
+    private void enqueue_flag_flush (
+        Account account,
+        Folder folder,
+        GenericArray<string> uids,
+        bool expunge = false
+    ) {
+        var key = flag_flush_key (account, folder);
+        var previous = this.flag_flush_latest.get (key);
         var job = new FlagFlushJob () {
             account = account,
             folder = folder,
             uids = uids,
+            expunge = expunge || (previous != null && previous.expunge),
         };
-        this.flag_flush_latest.set (flag_flush_key (account, folder), job);
+        this.flag_flush_latest.set (key, job);
+        this.flag_flush_retries.remove (key);
         this.flag_flush_queue.add (job);
         /* Cache-first: local Camel flags are already set. Server push waits for
          * sync-interval / manual refresh (flush_pending_local_changes). */
-        Utils.sync_log ("flag flush deferred “%s” %u messages".printf (folder.name, uids.length));
+        Utils.sync_log ("flag flush deferred “%s” %u messages%s".printf (
+            folder.name,
+            uids.length,
+            job.expunge ? " + expunge" : ""
+        ));
+    }
+
+    /* Failed EXPUNGE jobs stay pending without spinning the current flush.
+     * The next periodic/manual/shutdown flush stages one retry. */
+    private void stage_flag_flush_retries () {
+        var jobs = new GenericArray<FlagFlushJob> ();
+        this.flag_flush_retries.foreach ((key, job) => {
+            if (this.flag_flush_latest.get (key) == job)
+                jobs.add (job);
+        });
+        this.flag_flush_retries.remove_all ();
+        for (uint i = 0; i < jobs.length; i++)
+            this.flag_flush_queue.add (jobs[i]);
     }
 
     private async void pump_flag_flush () {
@@ -2509,7 +2546,9 @@ public class Mail.MailSession : Camel.Session {
             camel_folder = yield open_camel_folder (job.account, job.folder, null);
         } catch (Error e) {
             warning ("Could not push folder flags: %s", e.message);
-            if (this.flag_flush_latest.get (key) == job)
+            if (job.expunge && this.flag_flush_latest.get (key) == job)
+                this.flag_flush_retries.set (key, job);
+            else if (this.flag_flush_latest.get (key) == job)
                 this.flag_flush_latest.remove (key);
             return;
         }
@@ -2517,6 +2556,7 @@ public class Mail.MailSession : Camel.Session {
         var t0 = Utils.sync_tick ();
         var logged_pause = false;
         var done = 0u;
+        var failed = false;
         while (done < job.uids.length) {
             if (this.flag_flush_latest.get (key) != job)
                 return;
@@ -2540,10 +2580,11 @@ public class Mail.MailSession : Camel.Session {
             try {
                 /* synchronize_message only downloads bodies. Flag/follow-up/SEEN
                  * uploads go through folder.synchronize → backend save_flags. */
-                yield camel_folder.synchronize (false, Priority.LOW, null);
+                yield camel_folder.synchronize (job.expunge, Priority.LOW, null);
                 done = job.uids.length;
             } catch (Error e) {
                 warning ("Could not push folder flags for “%s”: %s", job.folder.name, e.message);
+                failed = true;
                 done = job.uids.length;
             } finally {
                 leave_camel (false);
@@ -2563,6 +2604,10 @@ public class Mail.MailSession : Camel.Session {
         if (this.flag_flush_latest.get (key) != job)
             return;
         apply_camel_counts (job.folder, camel_folder);
+        if (failed && job.expunge) {
+            this.flag_flush_retries.set (key, job);
+            return;
+        }
         this.flag_flush_latest.remove (key);
     }
 
@@ -2668,16 +2713,16 @@ public class Mail.MailSession : Camel.Session {
             }
 
             for (uint i = 0; i < batch.length; i++) {
-                var new_uid = batch[i];
+                string? new_uid = null;
                 if (transferred != null && i < transferred.length
                     && transferred[i] != null && transferred[i].length > 0)
                     new_uid = transferred[i];
-                if (job.delete_original)
+                if (job.delete_original && new_uid != null)
                     rekey_body (job.account, job.from, batch[i], job.destination, new_uid);
                 var message_index = done + i;
                 if (job.messages != null && message_index < job.messages.length) {
                     var message = job.messages[message_index];
-                    if (message != null && new_uid != message.uid) {
+                    if (message != null && new_uid != null && new_uid != message.uid) {
                         if (job.delete_original) {
                             rekey_body (
                                 job.account,
@@ -2689,7 +2734,10 @@ public class Mail.MailSession : Camel.Session {
                         }
                         message.uid = new_uid;
                     }
-                    if (message != null)
+                    /* Without COPYUID the destination UID is unknown. Retain
+                     * the unique local placeholder until header reconciliation
+                     * can match the real destination message safely. */
+                    if (message != null && new_uid != null)
                         message.local_only = false;
                 }
             }
@@ -2722,6 +2770,10 @@ public class Mail.MailSession : Camel.Session {
                 }
             } catch (Error e) {
                 warning ("Could not expunge moved messages: %s", e.message);
+                /* The copies already have destination UIDs. Keep the source
+                 * \Deleted flags queued so the next local-change flush retries
+                 * only the delete side instead of copying messages again. */
+                enqueue_flag_flush (job.account, job.from, job.uids, true);
                 transfer_error = transfer_error == null
                     ? e.message
                     : "%s; %s".printf (transfer_error, e.message);
