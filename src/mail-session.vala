@@ -652,9 +652,9 @@ public class Mail.MailSession : Camel.Session {
             ));
         }
 
-        apply_counts_from_messages (folder, messages);
-        messages = retain_local_only (account, folder, messages, previous);
         resolve_pending_body_rekeys (account, folder, messages);
+        messages = retain_local_only (account, folder, messages, previous);
+        retain_pending_transfer_placeholders (account, folder, messages);
         Conversation.prune_duplicate_sends (messages);
         apply_counts_from_messages (folder, messages);
         return messages;
@@ -678,6 +678,7 @@ public class Mail.MailSession : Camel.Session {
         }
         var messages = yield collect_messages (account, camel_folder, folder, null);
         resolve_pending_body_rekeys (account, folder, messages);
+        retain_pending_transfer_placeholders (account, folder, messages);
         apply_counts_from_messages (folder, messages);
         return messages;
     }
@@ -734,7 +735,6 @@ public class Mail.MailSession : Camel.Session {
                 return -1;
             return 0;
         });
-        resolve_pending_body_rekeys (account, folder, messages);
         return messages;
     }
 
@@ -1283,6 +1283,47 @@ public class Mail.MailSession : Camel.Session {
         return live;
     }
 
+    private void retain_pending_transfer_placeholders (
+        Account account,
+        Folder folder,
+        GenericArray<Message> live
+    ) {
+        var account_key = account.source_uid ?? account.uid;
+        var have_uid = new HashTable<string, uint8> (str_hash, str_equal);
+        for (uint i = 0; i < live.length; i++)
+            have_uid.set (live[i].uid, 1);
+
+        var added = false;
+        for (uint i = 0; i < this.pending_body_rekeys.length; i++) {
+            var pending = this.pending_body_rekeys[i];
+            if (pending.account_key != account_key
+                || pending.destination.full_name != folder.full_name
+                || pending.resolved_uid != null
+                || !pending.candidate.uid.has_prefix ("local-move-")
+                || have_uid.contains (pending.candidate.uid))
+                continue;
+
+            /* A completed bulk move without COPYUID can outlive the window
+             * that created its optimistic destination row. Restore the row
+             * from the durable rekey journal until a full folder summary can
+             * identify the real destination UID. */
+            Conversation.apply_folder (pending.candidate, folder, pending.candidate.uid);
+            pending.candidate.local_only = true;
+            live.add (pending.candidate);
+            have_uid.set (pending.candidate.uid, 1);
+            added = true;
+        }
+        if (added) {
+            live.sort ((a, b) => {
+                if (a.date < b.date)
+                    return 1;
+                if (a.date > b.date)
+                    return -1;
+                return 0;
+            });
+        }
+    }
+
     private void resolve_pending_body_rekeys (
         Account account,
         Folder folder,
@@ -1310,7 +1351,10 @@ public class Mail.MailSession : Camel.Session {
                 continue;
             rekey_body (account, pending.from, pending.uid, folder, replacement.uid);
             claimed.set (replacement.uid, 1);
-            pending.resolved_uid = replacement.uid;
+            if (pending.body_path == null)
+                this.pending_body_rekeys.remove_index (i);
+            else
+                pending.resolved_uid = replacement.uid;
             changed = true;
         }
         if (changed)
@@ -2831,6 +2875,10 @@ public class Mail.MailSession : Camel.Session {
                 var destination_name = state.get_string (group, "destination-name");
                 var destination_full_name = state.get_string (group, "destination-folder");
                 var outgoing = state.get_boolean (group, "outgoing");
+                var stored_uid = state.get_string (group, "uid");
+                var candidate_uid = stored_uid.has_prefix ("local-move-")
+                    ? "local-move-pending-%s".printf (group.substring ("body-".length))
+                    : stored_uid;
                 string? resolved_uid = null;
                 if (state.has_key (group, "resolved-uid")) {
                     var stored = state.get_string (group, "resolved-uid");
@@ -2838,12 +2886,24 @@ public class Mail.MailSession : Camel.Session {
                         resolved_uid = stored;
                 }
                 var candidate = new Message () {
-                    uid = state.get_string (group, "uid"),
+                    uid = candidate_uid,
                     subject = state.get_string (group, "subject"),
                     from = state.get_string (group, "from"),
                     to = state.get_string (group, "to"),
+                    cc = state.has_key (group, "cc") ? state.get_string (group, "cc") : "",
                     date = state.get_int64 (group, "date"),
                     outgoing = outgoing,
+                    seen = state.has_key (group, "seen") && state.get_boolean (group, "seen"),
+                    flagged = state.has_key (group, "flagged") && state.get_boolean (group, "flagged"),
+                    important = state.has_key (group, "important") && state.get_boolean (group, "important"),
+                    has_attachment = state.has_key (group, "has-attachment")
+                        && state.get_boolean (group, "has-attachment"),
+                    preview = state.has_key (group, "preview")
+                        ? state.get_string (group, "preview")
+                        : null,
+                    conversation_key = state.has_key (group, "conversation-key")
+                        ? state.get_string (group, "conversation-key")
+                        : null,
                     local_only = true,
                     msgid_hash = state.get_uint64 (group, "message-id-hash"),
                     folder_name = from_name,
@@ -2857,7 +2917,7 @@ public class Mail.MailSession : Camel.Session {
                         full_name = from_full_name,
                         flags = (uint) state.get_uint64 (group, "from-flags"),
                     },
-                    uid = candidate.uid,
+                    uid = stored_uid,
                     destination = new Folder () {
                         name = destination_name,
                         full_name = destination_full_name,
@@ -2906,8 +2966,19 @@ public class Mail.MailSession : Camel.Session {
             state.set_string (group, "subject", pending.candidate.subject ?? "");
             state.set_string (group, "from", pending.candidate.from ?? "");
             state.set_string (group, "to", pending.candidate.to ?? "");
+            state.set_string (group, "cc", pending.candidate.cc ?? "");
             state.set_int64 (group, "date", pending.candidate.date);
             state.set_boolean (group, "outgoing", pending.candidate.outgoing);
+            state.set_boolean (group, "seen", pending.candidate.seen);
+            state.set_boolean (group, "flagged", pending.candidate.flagged);
+            state.set_boolean (group, "important", pending.candidate.important);
+            state.set_boolean (group, "has-attachment", pending.candidate.has_attachment);
+            state.set_string (group, "preview", pending.candidate.preview ?? "");
+            state.set_string (
+                group,
+                "conversation-key",
+                pending.candidate.conversation_key ?? ""
+            );
             state.set_uint64 (group, "message-id-hash", pending.candidate.msgid_hash);
             if (pending.resolved_uid != null)
                 state.set_string (group, "resolved-uid", pending.resolved_uid);
@@ -3201,10 +3272,9 @@ public class Mail.MailSession : Camel.Session {
             for (uint i = done; i < end; i++)
                 batch.add (job.uids[i]);
 
-            if (job.delete_original) {
-                for (uint i = 0; i < batch.length; i++)
-                    yield capture_local_body (job.account, job.from, batch[i], source_folder);
-            }
+            Camel.MimeMessage? captured_body = null;
+            if (job.delete_original)
+                captured_body = yield capture_local_body (job.account, job.from, batch[0], source_folder);
 
 #if HAVE_CAMEL_3_58
             GenericArray<weak string>? transferred = null;
@@ -3231,6 +3301,7 @@ public class Mail.MailSession : Camel.Session {
                 break;
             }
 
+            var pending_changed = false;
             for (uint i = 0; i < batch.length; i++) {
                 string? new_uid = null;
                 if (transferred != null && i < transferred.length
@@ -3258,8 +3329,27 @@ public class Mail.MailSession : Camel.Session {
                      * can match the real destination message safely. */
                     if (message != null && new_uid != null)
                         message.local_only = false;
+                    if (message != null && job.delete_original && new_uid == null) {
+                        /* The server completed the move but supplied no
+                         * destination UID. Journal both the optimistic header
+                         * and any offline body before completion signals can
+                         * persist caches that intentionally omit placeholders. */
+                        var pending = new PendingBodyRekey () {
+                            account_key = job.account.source_uid ?? job.account.uid,
+                            from = job.destination,
+                            uid = message.uid,
+                            destination = job.destination,
+                            candidate = message,
+                        };
+                        if (captured_body != null)
+                            persist_pending_body (pending, captured_body);
+                        this.pending_body_rekeys.add (pending);
+                        pending_changed = true;
+                    }
                 }
             }
+            if (pending_changed)
+                save_pending_sync_state ();
 
             done = end;
             if (done == job.uids.length || done % 30 == 0) {
