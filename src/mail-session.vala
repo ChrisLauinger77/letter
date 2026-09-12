@@ -65,6 +65,7 @@ public class Mail.MailSession : Camel.Session {
         Folder destination,
         GenericArray<string> uids,
         GenericArray<Message>? messages,
+        GenericArray<TransferCountChange>? count_changes,
         string error
     );
 
@@ -390,6 +391,7 @@ public class Mail.MailSession : Camel.Session {
         public Folder destination;
         public GenericArray<string> uids;
         public GenericArray<Message>? messages;
+        public GenericArray<TransferCountChange>? count_changes;
         public bool delete_original;
     }
 
@@ -2553,7 +2555,8 @@ public class Mail.MailSession : Camel.Session {
         Folder from,
         Folder destination,
         GenericArray<string> uids,
-        GenericArray<Message>? messages
+        GenericArray<Message>? messages,
+        GenericArray<TransferCountChange>? count_changes = null
     ) {
         if (uids.length == 0)
             return;
@@ -2564,6 +2567,7 @@ public class Mail.MailSession : Camel.Session {
             destination = destination,
             uids = uids,
             messages = messages,
+            count_changes = count_changes,
             delete_original = true,
         };
         bump_transfer_pending (account, from, 1);
@@ -2586,7 +2590,8 @@ public class Mail.MailSession : Camel.Session {
         Folder from,
         Folder destination,
         GenericArray<string> uids,
-        GenericArray<Message>? messages
+        GenericArray<Message>? messages,
+        GenericArray<TransferCountChange>? count_changes = null
     ) {
         if (uids.length == 0)
             return;
@@ -2597,6 +2602,7 @@ public class Mail.MailSession : Camel.Session {
             destination = destination,
             uids = uids,
             messages = messages,
+            count_changes = count_changes,
             delete_original = false,
         };
         bump_transfer_pending (account, from, 1);
@@ -3306,6 +3312,11 @@ public class Mail.MailSession : Camel.Session {
             this.transfer_pending.set (key, n);
     }
 
+    private uint transfer_pending_count (Account account, Folder folder) {
+        var key = flag_flush_key (account, folder);
+        return this.transfer_pending.contains (key) ? this.transfer_pending.get (key) : 0;
+    }
+
     private async void pump_transfer_flush () {
         if (this.transfer_flush_running)
             return;
@@ -3483,8 +3494,13 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
 
-        apply_camel_counts (job.from, source_folder);
-        apply_camel_counts (job.destination, dest_folder);
+        /* A later queued transfer may already be represented optimistically in
+         * Folder counts but not in Camel yet. Preserve those deltas until the
+         * last job touching each folder has finished. */
+        if (transfer_pending_count (job.account, job.from) <= 1)
+            apply_camel_counts (job.from, source_folder);
+        if (transfer_pending_count (job.account, job.destination) <= 1)
+            apply_camel_counts (job.destination, dest_folder);
         bump_transfer_pending (job.account, job.from, -1);
         if (job.from.full_name != job.destination.full_name)
             bump_transfer_pending (job.account, job.destination, -1);
@@ -3505,12 +3521,19 @@ public class Mail.MailSession : Camel.Session {
             for (uint i = done; i < job.messages.length; i++)
                 remaining_messages.add (job.messages[i]);
         }
+        GenericArray<TransferCountChange>? remaining_count_changes = null;
+        if (job.count_changes != null) {
+            remaining_count_changes = new GenericArray<TransferCountChange> ();
+            for (uint i = done; i < job.count_changes.length; i++)
+                remaining_count_changes.add (job.count_changes[i]);
+        }
         this.transfer_failed (
             job.account,
             job.from,
             job.destination,
             remaining,
             remaining_messages,
+            remaining_count_changes,
             error
         );
     }
@@ -4654,6 +4677,13 @@ public class Mail.Recipient : Object {
             return display;
         }
     }
+}
+
+public class Mail.TransferCountChange : Object {
+    public bool source_total_decremented;
+    public bool source_unread_decremented;
+    public bool destination_total_incremented;
+    public bool destination_unread_incremented;
 }
 
 public class Mail.MessageContent : Object {
