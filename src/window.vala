@@ -5473,10 +5473,22 @@ public class Mail.Window : Adw.ApplicationWindow {
                 save_header_list_cache_now (account, folder, cache);
         } catch (Error e) {
             this.hidden_uids.remove (hide_key (account, folder, uid));
+            add_to_folder_cache (account, folder, message);
+            restore_to_search_results (message);
+            var cache = this.message_cache.get (message_cache_key (account, folder));
+            if (cache != null) {
+                sort_messages_by_date (cache);
+                save_header_list_cache_now (account, folder, cache);
+            }
+            restore_folder_counts_from_cache (account, folder);
+            refresh_folder_badge (folder);
+            if (is_searching && this.search_results != null)
+                display_search_results (this.search_results);
+            else
+                redisplay_current_list ();
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 4,
             });
-            refresh_open_folder.begin (true, false);
         }
     }
 
