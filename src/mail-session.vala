@@ -2613,6 +2613,7 @@ public class Mail.MailSession : Camel.Session {
         uint done = 0;
         var t0 = Utils.sync_tick ();
         var logged_pause = false;
+        string? transfer_error = null;
         while (done < job.uids.length) {
             if (this.high_refresh_waiters > 0) {
                 if (!logged_pause) {
@@ -2636,8 +2637,10 @@ public class Mail.MailSession : Camel.Session {
             for (uint i = done; i < end; i++)
                 batch.add (job.uids[i]);
 
-            for (uint i = 0; i < batch.length; i++)
-                yield capture_local_body (job.account, job.from, batch[i], source_folder);
+            if (job.delete_original) {
+                for (uint i = 0; i < batch.length; i++)
+                    yield capture_local_body (job.account, job.from, batch[i], source_folder);
+            }
 
 #if HAVE_CAMEL_3_58
             GenericArray<weak string>? transferred = null;
@@ -2655,15 +2658,13 @@ public class Mail.MailSession : Camel.Session {
                         null,
                         out transferred
                     );
-                    if (job.delete_original)
-                        yield source_folder.synchronize (true, Priority.LOW, null);
                 } finally {
                     leave_camel (false);
                 }
             } catch (Error e) {
                 warning ("Could not move messages: %s", e.message);
-                finish_transfer_job (job, done, e.message);
-                return;
+                transfer_error = e.message;
+                break;
             }
 
             for (uint i = 0; i < batch.length; i++) {
@@ -2671,21 +2672,24 @@ public class Mail.MailSession : Camel.Session {
                 if (transferred != null && i < transferred.length
                     && transferred[i] != null && transferred[i].length > 0)
                     new_uid = transferred[i];
-                rekey_body (job.account, job.from, batch[i], job.destination, new_uid);
+                if (job.delete_original)
+                    rekey_body (job.account, job.from, batch[i], job.destination, new_uid);
                 var message_index = done + i;
                 if (job.messages != null && message_index < job.messages.length) {
                     var message = job.messages[message_index];
                     if (message != null && new_uid != message.uid) {
-                        rekey_body (
-                            job.account,
-                            job.destination,
-                            message.uid,
-                            job.destination,
-                            new_uid
-                        );
+                        if (job.delete_original) {
+                            rekey_body (
+                                job.account,
+                                job.destination,
+                                message.uid,
+                                job.destination,
+                                new_uid
+                            );
+                        }
                         message.uid = new_uid;
                     }
-                    if (message != null && job.delete_original)
+                    if (message != null)
                         message.local_only = false;
                 }
             }
@@ -2703,6 +2707,30 @@ public class Mail.MailSession : Camel.Session {
 
             Idle.add (flush_folder_transfers.callback);
             yield;
+        }
+
+        /* COPY + \Deleted is the fallback when the server lacks UID MOVE.
+         * Complete all copies first, then upload/EXPUNGE the source flags once
+         * for the whole job instead of once per selected message. */
+        if (job.delete_original && done > 0) {
+            try {
+                yield enter_camel (false);
+                try {
+                    yield source_folder.synchronize (true, Priority.LOW, null);
+                } finally {
+                    leave_camel (false);
+                }
+            } catch (Error e) {
+                warning ("Could not expunge moved messages: %s", e.message);
+                transfer_error = transfer_error == null
+                    ? e.message
+                    : "%s; %s".printf (transfer_error, e.message);
+            }
+        }
+
+        if (transfer_error != null) {
+            finish_transfer_job (job, done, transfer_error);
+            return;
         }
 
         apply_camel_counts (job.from, source_folder);

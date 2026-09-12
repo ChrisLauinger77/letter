@@ -5090,12 +5090,14 @@ public class Mail.Window : Adw.ApplicationWindow {
             if (important) {
                 if (folder.kind == FolderKind.IMPORTANT)
                     continue;
-                if (find_important_uid (message) == null)
-                    dest_cache.add (message);
+                if (find_important_uid (message) != null)
+                    continue;
+                var destination_copy = make_local_copy (message, destination);
+                dest_cache.add (destination_copy);
                 var uids = new GenericArray<string> ();
                 uids.add (message.uid);
                 var copies = new GenericArray<Message> ();
-                copies.add (message);
+                copies.add (destination_copy);
                 this.mail_session.enqueue_copy_messages (account, folder, destination, uids, copies);
             } else {
                 var uid = folder.kind == FolderKind.IMPORTANT
@@ -5909,6 +5911,35 @@ public class Mail.Window : Adw.ApplicationWindow {
             destination.unread++;
     }
 
+    private Message make_local_copy (Message source, Folder destination) {
+        this.transfer_placeholder_serial++;
+        return new Message () {
+            uid = "local-copy-%llu".printf (this.transfer_placeholder_serial),
+            subject = source.subject,
+            from = source.from,
+            to = source.to,
+            cc = source.cc,
+            from_blob = source.from_blob,
+            to_blob = source.to_blob,
+            list_address = source.list_address,
+            date = source.date,
+            seen = source.seen,
+            flagged = source.flagged,
+            important = true,
+            has_attachment = source.has_attachment,
+            preview = source.preview,
+            folder_name = destination.name,
+            folder_full_name = destination.full_name,
+            show_folder = source.show_folder,
+            outgoing = source.outgoing,
+            msgid_hash = source.msgid_hash,
+            msgid_refs = source.msgid_refs,
+            conversation_key = source.conversation_key,
+            search_blob = source.search_blob,
+            local_only = true,
+        };
+    }
+
     private void drop_conversations (GenericArray<Conversation> conversations) {
         if (conversations.length == 0) {
             this.message_selection.unselect_all ();
@@ -6037,8 +6068,11 @@ public class Mail.Window : Adw.ApplicationWindow {
         /* Drop the optimistic destination placeholders. The source cache is
          * rebuilt from Camel below, where the originals still exist. */
         var destination_cache = this.message_cache.get (message_cache_key (account, destination));
+        var failed_copy = false;
         if (messages != null) {
             for (uint i = 0; i < messages.length; i++) {
+                if (messages[i].uid.has_prefix ("local-copy-"))
+                    failed_copy = true;
                 if (i < uids.length) {
                     this.mail_session.rekey_body (
                         account,
@@ -6060,6 +6094,16 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         if (!is_current_account (account))
             return;
+        if (failed_copy) {
+            /* Removing a failed Gmail Important copy also clears the
+             * optimistic marker on its source message and persisted caches. */
+            sync_important_markers ();
+            var source_cache = this.message_cache.get (message_cache_key (account, from));
+            if (source_cache != null)
+                save_header_list_cache_now (account, from, source_cache);
+            if (destination_cache != null)
+                save_header_list_cache_now (account, destination, destination_cache);
+        }
         enqueue_sync_job (SYNC_KIND_HEADERS, from, RANK_SELECTED_HEADERS);
         if (from.full_name != destination.full_name && destination_cache != null)
             enqueue_sync_job (SYNC_KIND_HEADERS, destination, RANK_SELECTED_HEADERS);
